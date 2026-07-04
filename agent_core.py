@@ -24,6 +24,8 @@ from tools import web_search as _web_search
 from db import mem_search, mem_index
 from documents import is_office_doc, read_document, write_document
 
+_http = requests.Session()  # connexion reutilisee (keep-alive) pour les appels Ollama
+
 AGENT_MODEL = "qwen3-coder:30b"
 # -1 = modele garde en RAM en permanence : l'evaluation du prompt (19 outils +
 # consignes ~4700 tokens) prend ~6 min A FROID sur ce CPU contre ~4s avec le
@@ -261,6 +263,7 @@ def _tool_write_file(args):
                 f.write(content)
     except Exception as e:
         return {"error": f"écriture impossible : {e}"}
+    _audit_write_if_outside_workspace("write_file", path)
     return {"ok": True, "path": path, "bytes": len(content)}
 
 def _tool_list_dir(args):
@@ -284,22 +287,50 @@ def _tool_list_dir(args):
         return {"error": str(e)}
     return {"path": path, "entries": entries}
 
+AUDIT_LOG_PATH = r"C:\Devllma\logs\agent_audit.log"
+
+def _audit_log(tool, detail, outcome):
+    """Journal d'audit des actions a fort impact (commandes systeme, code execute) —
+    le safety_check regex reste contournable (alias PowerShell, base64, code genere
+    par le modele) ; a defaut d'un vrai bac a sable, avoir une trace de CE QUI a
+    tourne reellement permet au moins de detecter/investiguer apres coup."""
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{ts}] {tool} | {detail[:300].replace(chr(10),' ')} | {outcome}\n")
+    except Exception:
+        pass
+
+def _audit_write_if_outside_workspace(tool, path):
+    """write_file/edit_file ne passent PAS par safety_check pour le CHEMIN (seulement
+    pour le contenu) : une ecriture hors du dossier de projets est le cas le plus a
+    risque (fichiers systeme, config d'autres logiciels...) et merite une trace,
+    meme si elle n'est pas bloquee (l'utilisateur peut legitimement vouloir editer
+    un fichier ailleurs sur le poste — cf. l'agent generaliste concu pour ca)."""
+    if not os.path.realpath(path).lower().startswith(os.path.realpath(WORKSPACE_DIR).lower()):
+        _audit_log(tool, path, "ECRITURE HORS WORKSPACE")
+
 def _tool_run_powershell(args):
     cmd = args.get("command", "")
     safe, reasons = safety_check(cmd)
     if not safe:
+        _audit_log("run_powershell", cmd, f"BLOQUE: {reasons}")
         return {"error": f"commande bloquée par sécurité : {reasons}"}
     timeout = min(int(args.get("timeout") or 25), 60)
     try:
         r = subprocess.run(["powershell", "-NonInteractive", "-Command", cmd],
                             capture_output=True, text=True, timeout=timeout,
                             encoding="utf-8", errors="replace")
+        _audit_log("run_powershell", cmd, f"returncode={r.returncode}")
         return {"returncode": r.returncode,
                 "stdout": (r.stdout or "").strip()[:3000],
                 "stderr": (r.stderr or "").strip()[:1000]}
     except subprocess.TimeoutExpired:
+        _audit_log("run_powershell", cmd, "TIMEOUT")
         return {"error": f"la commande a dépassé le timeout de {timeout}s"}
     except Exception as e:
+        _audit_log("run_powershell", cmd, f"EXCEPTION: {e}")
         return {"error": str(e)}
 
 def _tool_web_search(args):
@@ -392,6 +423,7 @@ def _tool_execute_python(args):
     code = args.get("code", "")
     safe, reasons = safety_check(code)
     if not safe:
+        _audit_log("execute_python", code, f"BLOQUE: {reasons}")
         return {"error": f"code bloqué par sécurité : {reasons}"}
     import uuid
     script_path = os.path.join(os.environ.get("TEMP", "."), f"_devllma_agent_exec_{uuid.uuid4().hex}.py")
@@ -400,12 +432,15 @@ def _tool_execute_python(args):
             f.write(code)
         r = subprocess.run([sys.executable, script_path], capture_output=True, text=True,
                             timeout=20, encoding="utf-8", errors="replace")
+        _audit_log("execute_python", code, f"returncode={r.returncode}")
         return {"stdout": (r.stdout or "").strip()[:3000],
                 "stderr": (r.stderr or "").strip()[:1000],
                 "returncode": r.returncode}
     except subprocess.TimeoutExpired:
+        _audit_log("execute_python", code, "TIMEOUT")
         return {"error": "le script a dépassé le timeout de 20s"}
     except Exception as e:
+        _audit_log("execute_python", code, f"EXCEPTION: {e}")
         return {"error": str(e)}
     finally:
         try: os.remove(script_path)
@@ -462,6 +497,7 @@ def _tool_edit_file(args):
         except OSError:
             pass
         return {"error": f"ecriture impossible : {e}"}
+    _audit_write_if_outside_workspace("edit_file", path)
     line = work[:work.find(old_n)].count("\n") + 1
     return {"ok": True, "path": path, "remplacements": n if replace_all else 1, "premiere_ligne_modifiee": line}
 
@@ -798,7 +834,7 @@ def warm_agent_cache():
     redemarrage paie ~6 min d'evaluation de prompt a froid (mesure sur ce CPU),
     ce qui depasse tous les timeouts et ressemble a une panne."""
     try:
-        requests.post(OLLAMA + "/api/chat", json={
+        _http.post(OLLAMA + "/api/chat", json={
             "model": AGENT_MODEL,
             "messages": [{"role": "system", "content": AGENT_SYSTEM},
                           {"role": "user", "content": "ping"}],
@@ -823,8 +859,16 @@ def _chat_call(messages, tools=None, temperature=0.3):
     last_err = None
     for attempt in range(3):
         try:
-            r = requests.post(OLLAMA + "/api/chat", json=payload, timeout=300)
-            return r.json().get("message", {"role": "assistant", "content": ""})
+            r = _http.post(OLLAMA + "/api/chat", json=payload, timeout=300)
+            body = r.json()
+            # Ollama repond 200/404 avec {"error": "..."} (ex: modele non pulle) plutot
+            # qu'une exception HTTP — sans ce controle, .get("message",{}) retombe
+            # silencieusement sur un contenu vide et l'agent semble ne rien repondre.
+            if "error" in body:
+                return {"role": "assistant", "content":
+                        f"(modele '{AGENT_MODEL}' indisponible sur Ollama : {body['error']} — "
+                        f"verifie qu'il est bien telecharge dans le panneau Modeles)"}
+            return body.get("message", {"role": "assistant", "content": ""})
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_err = e
             time.sleep(2 * (attempt + 1))

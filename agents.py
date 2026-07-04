@@ -1,6 +1,7 @@
 ﻿import requests, json, sys, re, unicodedata
 
 OLLAMA = "http://localhost:11434"
+_http = requests.Session()  # connexion reutilisee (keep-alive) pour les appels Ollama
 
 def strip_accents(s):
     """Retire les accents (é->e, à->a...) pour que le matching de mots-cles fonctionne
@@ -177,7 +178,7 @@ def call(agent_name, prompt, stream=True):
         print(f"\n\033[1;36m[{agent_name.upper()}]\033[0m ", end="", flush=True)
         full = ""
         try:
-            r = requests.post(f"{OLLAMA}/api/generate", json=payload, stream=True, timeout=300)
+            r = _http.post(f"{OLLAMA}/api/generate", json=payload, stream=True, timeout=300)
             for line in r.iter_lines():
                 if line:
                     d = json.loads(line)
@@ -191,7 +192,7 @@ def call(agent_name, prompt, stream=True):
         return full
     else:
         try:
-            r = requests.post(f"{OLLAMA}/api/generate", json=payload, timeout=300)
+            r = _http.post(f"{OLLAMA}/api/generate", json=payload, timeout=300)
             return r.json().get("response","")
         except Exception as e:
             return f"Erreur: {e}"

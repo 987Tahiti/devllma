@@ -1,13 +1,28 @@
 ﻿import sqlite3, os, json
+import requests
 from datetime import datetime
 
 DB = r"C:\Devllma\database\devllma.db"
 OLLAMA = "http://localhost:11434"
 EMBED_MODEL = "nomic-embed-text"
+# Session partagee (connexion TCP + keep-alive reutilises) : embed() est appele a
+# CHAQUE mem_search/mem_index, une nouvelle connexion a chaque fois est un cout
+# evitable meme en local.
+_http = requests.Session()
 
 def cx():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    return sqlite3.connect(DB)
+    c = sqlite3.connect(DB)
+    # WAL : les lecteurs (mem_search, history...) ne bloquent plus sur un ecrivain
+    # (msg, mem_index...) — sans ca, plusieurs WebSocket actives en meme temps
+    # peuvent produire "database is locked" (mode rollback-journal par defaut,
+    # une seule connexion a la fois quelle que soit lecture/ecriture). WAL est un
+    # reglage persistant du fichier .db (le PRAGMA suivant est quasi gratuit une
+    # fois deja active) ; busy_timeout fait patienter au lieu d'echouer immediatement
+    # sur la rare collision d'ecriture concurrente.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
 
 def init():
     with cx() as c:
@@ -143,9 +158,8 @@ def stats():
 # ════════════════════════════════════════════════════════════════════════════
 def embed(text):
     """Calcule le vecteur d'un texte via Ollama (nomic-embed-text). None si indisponible."""
-    import requests
     try:
-        r = requests.post(f"{OLLAMA}/api/embeddings",
+        r = _http.post(f"{OLLAMA}/api/embeddings",
                           json={"model": EMBED_MODEL, "prompt": text[:6000]},
                           timeout=30)
         vec = r.json().get("embedding")
