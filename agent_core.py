@@ -15,7 +15,7 @@ declenche par le meme routage qu'avant (has_dev_keywords / is_edit / projet
 existant). Cet agent gere tout le reste : questions, recherche, actions systeme,
 lecture/edition ponctuelle de fichiers, taches "de la vie de tous les jours".
 """
-import os, re, sys, ast, json, time, difflib, fnmatch, subprocess, requests
+import os, re, sys, ast, json, time, threading, difflib, fnmatch, subprocess, requests
 from datetime import datetime
 
 from agents import OLLAMA
@@ -299,6 +299,51 @@ def _audit_log(tool, detail, outcome):
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"[{ts}] {tool} | {detail[:300].replace(chr(10),' ')} | {outcome}\n")
+    except Exception:
+        pass
+
+# Journal JSONL complementaire du .log texte ci-dessus : le JSONL couvre 100% des
+# outils a impact AU POINT DE DISPATCH (une ligne machine-exploitable par appel :
+# ts, outil, args resumes, ok/erreur, duree) ; le .log texte garde le DETAIL interne
+# des outils sensibles (raisons de blocage safety_check, returncode, timeout) que
+# le dispatch ne voit pas. Les DEUX sont conserves.
+AUDIT_JSONL_PATH = r"C:\Devllma\logs\agent_audit.jsonl"
+_audit_lock = threading.Lock()  # run_agent_sync tourne dans des threads executor
+_AUDITED_TOOLS = {"run_powershell", "execute_python", "write_file", "edit_file", "run_sql", "http_request", "open_path"}
+# Cles REELLES porteuses de contenu volumineux, verifiees dans les _tool_* :
+# write_file->content, execute_python->code, edit_file->old_string/new_string,
+# run_powershell->command, run_sql->query (PAS 'sql'), http_request->json_body (PAS 'body')
+_CONTENT_KEYS = {"content", "code", "old_string", "new_string", "command", "query", "json_body"}
+# run_sql mssql recoit password/user en clair ; http_request accepte un dict headers
+# pouvant porter Authorization/API keys -> jamais de valeur en clair dans le journal
+_SECRET_KEYS = {"password", "pwd", "token", "api_key", "authorization"}
+
+def _summarize_args(args):
+    out = {}
+    for k, v in args.items():
+        kl = k.lower()
+        if kl in _SECRET_KEYS:
+            out[k] = "<redige>"
+        elif kl == "headers" and isinstance(v, dict):
+            out[k] = "<cles: " + ", ".join(sorted(str(x) for x in v)) + ">"  # noms seulement, jamais les valeurs
+        else:
+            s = str(v)  # json_body peut etre un dict apres json.loads — toujours str-ifier avant de trancher
+            if kl in _CONTENT_KEYS:
+                out[k] = f"<{len(s)} cars> " + s[:120].replace("\n", " ").replace("\r", " ")
+            else:
+                out[k] = s[:300]
+    return out
+
+def _audit_jsonl(tool, args, status, duration_s):
+    """L'audit ne doit JAMAIS faire echouer l'agent : tout est avale."""
+    try:
+        line = json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "tool": tool,
+                            "args": _summarize_args(args), "status": status,
+                            "duree_s": duration_s}, ensure_ascii=False)
+        with _audit_lock:
+            os.makedirs(os.path.dirname(AUDIT_JSONL_PATH), exist_ok=True)
+            with open(AUDIT_JSONL_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except Exception:
         pass
 
@@ -946,7 +991,19 @@ def run_agent_sync(prompt, history_text="", notify=None, should_stop=None):
             else:
                 seen_calls.add(sig)
                 _notify("tool_call", {"name": name, "args": args})
-                result = impl(args)
+                t0 = time.perf_counter()
+                try:
+                    result = impl(args)
+                except Exception:
+                    # un impl qui leve (rare, la plupart retournent {'error':...})
+                    # doit quand meme laisser une trace avant de remonter
+                    if name in _AUDITED_TOOLS:
+                        _audit_jsonl(name, args, "exception", round(time.perf_counter() - t0, 3))
+                    raise
+                if name in _AUDITED_TOOLS:
+                    # les blocages safety_check remontent deja en {'error': ...} -> 'erreur'
+                    status = "erreur" if isinstance(result, dict) and "error" in result else "ok"
+                    _audit_jsonl(name, args, status, round(time.perf_counter() - t0, 3))
                 _notify("tool_result", {"name": name, "result": result})
             messages.append({
                 "role": "tool",

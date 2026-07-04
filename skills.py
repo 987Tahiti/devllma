@@ -226,7 +226,14 @@ class SnapshotManager:
 # ════════════════════════════════════════════════════════════════════════════
 #  safety_check — garde-fou : bloque le code DESTRUCTEUR avant exécution
 # ════════════════════════════════════════════════════════════════════════════
-# Motifs qui ne doivent JAMAIS être exécutés sur le PC (protection système)
+# Motifs qui ne doivent JAMAIS être exécutés sur le PC (protection système).
+# Garde-fou best-effort : des regex ne peuvent PAS être exhaustives face à
+# l'obfuscation (concaténation de chaînes, variables, iex, base64 imbriqué...).
+# Le vrai contrôle est ailleurs : _DENY_PREFIXES/_guard_path (agent_core.py) pour
+# les chemins, les journaux d'audit _audit_log/_audit_jsonl (agent_core.py) pour
+# la trace de ce qui a réellement tourné. Ne pas empiler des dizaines de motifs
+# fragiles ici : seuls les motifs sans usage légitime plausible et à très faible
+# risque de faux positif.
 DANGER_PATTERNS = [
     (r'shutil\.rmtree\s*\(\s*[\'"]?[A-Za-z]:[\\/]?[\'"]?\s*\)', "rmtree sur une racine de disque"),
     (r'rmdir\s+/s\s+/q\s+[A-Za-z]:', "rmdir récursif sur un disque"),
@@ -238,6 +245,11 @@ DANGER_PATTERNS = [
     (r'(?:diskpart|cipher\s+/w|sdelete)', "outil d'effacement disque"),
     (r'while\s+True\s*:(?:[^\n]*\n)?\s*(?:os\.fork|subprocess|Thread)', "fork-bomb potentielle"),
     (r':\(\)\s*\{\s*:\|:&\s*\}\s*;', "fork-bomb bash"),
+    (r'-enc(?:odedcommand)?\s+[A-Za-z0-9+/=]{16,}', "commande PowerShell encodée base64 (contournement d'inspection)"),  # >=16 cars base64 : '-enc utf8'/'-Encoding utf8' passent ; FP residuel accepte hors PowerShell
+    (r'Set-MpPreference\s[^\n]*-Disable', "désactivation de Windows Defender"),
+    (r'vssadmin\s+delete\s+shadows', "suppression des clichés instantanés (schéma ransomware)"),
+    (r'bcdedit\s+/(?:set|delete|deletevalue)', "modification de la configuration de démarrage Windows"),
+    (r'\b(?:ri|rm|rd|del|erase)\s[^\n;|&]*-Recurse[^\n;|&]*[A-Za-z]:\\(?:Windows|Users|Program)', "suppression récursive sur dossier système via alias PowerShell"),  # [^;|&] : ne pas enjamber un separateur d'instructions
 ]
 
 def safety_check(code):

@@ -126,6 +126,15 @@ def _v_dev_pipeline(text, events):
     ok = any(e.get("ok") for e in run_results)
     return ok, f"run_results : {[(e.get('ok'), str(e.get('output'))[:80]) for e in run_results]}"
 
+def _v_snippet(text, events):
+    # Un snippet trivial doit etre streame par le CODER directement : pas de pipeline
+    # projet (pas de project_done/file_created), une reponse contenant du code, et vite.
+    kinds = {e.get("type") for e in events}
+    used_coder = any(e.get("type") == "agent_start" and e.get("agent") == "coder" for e in events)
+    has_code = ("def " in text) or ("```" in text)
+    ok = "project_done" not in kinds and "file_created" not in kinds and used_coder and has_code
+    return ok, f"evenements: {sorted(kinds)}, coder={used_coder}, code present={has_code}"
+
 TESTS = {
     "time":  ("Quelle heure est-il en ce moment ?", _v_time, 240),
     "doc":   (f"Cree un fichier Word {EVAL_DIR}\\rapport_eval.docx contenant le titre 'Rapport DevLLMA' et une phrase de test.", _v_doc_word, 360),
@@ -135,6 +144,10 @@ TESTS = {
     "calc":  ("Combien font exactement 1234 multiplie par 5678 ? Calcule precisement.", _v_calc, 300),
     "chat":  ("Explique-moi en deux phrases la difference entre une liste et un tuple en Python.", _v_no_dev_pipeline, 240),
     "dev":   ("Cree un script python calculatrice_eval qui affiche le resultat de 6*7 puis se termine.", _v_dev_pipeline, 900),
+    # Place en DERNIER : le modele coder est alors chaud, le budget 120 s (vs 900 pour
+    # "dev") verrouille la perf du fast-path — une regression vers le pipeline projet
+    # (~90 s + plan brain) rend le test rouge (timeout ou project_done).
+    "snippet": ("Ecris une fonction python qui additionne deux nombres.", _v_snippet, 120),
 }
 
 

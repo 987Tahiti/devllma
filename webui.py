@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, Response, PlainTextResponse, FileRes
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from db import init, new_session, msg, history, list_sessions, mem_search, mem_index, mem_get, mem_set, stats as db_stats, delete_session, mem_list, mem_delete, mem_purge
-from agents import AGENTS, route, OLLAMA, has_dev_keywords, is_research_question, GREETINGS, _kw_match, strip_accents
+from agents import AGENTS, route, OLLAMA, has_dev_keywords, is_research_question, GREETINGS, _kw_match, strip_accents, is_trivial_snippet
 from skills import SnapshotManager, Skills, safety_check, security_scan, BrainMemory, extract_files as extract_files_robust
 try:
     from tools import read_image_text
@@ -63,8 +63,20 @@ BRAIN_MEMORY = {
     "context": ""         # résumé texte pour le brain
 }
 
-def load_workspace_memory():
-    """Scanne le workspace et charge la mémoire des projets existants"""
+# -inf : garantit l'execution du scan initial meme juste apres le boot
+# (time.monotonic() ~ uptime Windows, proche de 0 au demarrage de la machine).
+_ws_mem_ts = -1e9
+
+def load_workspace_memory(force=False):
+    """Scanne le workspace et charge la mémoire des projets existants.
+    TTL 5 s : le scan complet (os.walk de chaque projet + SQLite) etait refait a
+    CHAQUE prompt dev et get_projects ; on le rejoue au plus toutes les 5 s, sauf
+    force=True apres une ecriture de fichiers (la liste projets envoyee a l'UI
+    doit refleter le nouveau projet immediatement). Rebind atomique de
+    BRAIN_MEMORY["projects"] (GIL) -> pas de verrou, pire cas un scan redondant."""
+    global _ws_mem_ts
+    if not force and time.monotonic() - _ws_mem_ts < 5:
+        return
     projects = []
     if os.path.isdir(WORKSPACE):
         for d in sorted(os.listdir(WORKSPACE)):
@@ -88,6 +100,7 @@ def load_workspace_memory():
         BRAIN_MEMORY["context"] = summary
     else:
         BRAIN_MEMORY["context"] = "Aucun projet encore créé."
+    _ws_mem_ts = time.monotonic()
 
 load_workspace_memory()
 
@@ -498,8 +511,13 @@ async def models_detail():
 
 BENCH_RESULTS_PATH = r"C:\Devllma\bench_results.json"
 
+# NB : les handlers "def" (sans async) de ce fichier sont executes par Starlette
+# dans son threadpool — leurs I/O bloquantes (SQLite, disque, subprocess) ne gelent
+# donc plus la boucle asyncio ni le streaming des WebSockets, comme /models via
+# run_in_executor. Ne pas les repasser en "async def" sans envelopper leurs appels
+# bloquants dans un executor.
 @app.get("/bench_results")
-async def bench_results():
+def bench_results():
     """Derniers resultats du banc d'essai comparatif (bench_models.py), si disponibles."""
     if os.path.exists(BENCH_RESULTS_PATH):
         try:
@@ -589,7 +607,7 @@ def get_temp():
     return raw
 
 @app.get("/stats")
-async def stats_endpoint():
+def stats_endpoint():
     """Usage temps réel du poste : CPU %, RAM, température."""
     if psutil is None:
         try:
@@ -612,7 +630,7 @@ async def stats_endpoint():
     }
 
 @app.get("/snapshots/{project}")
-async def get_snapshots(project: str):
+def get_snapshots(project: str):
     """Liste les sauvegardes restaurables d'un projet."""
     rows = SnapshotManager.list_snapshots(project)
     return {"snapshots": [{"id": r[0], "label": r[1], "files": r[2], "ts": r[3]} for r in rows]}
@@ -651,7 +669,7 @@ def _build_tree(path):
     return entries
 
 @app.get("/tree/{project}")
-async def get_tree(project: str):
+def get_tree(project: str):
     """Arborescence complete d'un projet du workspace, pour la visionneuse sidebar."""
     full = _safe_workspace_path(project)
     if not full or not os.path.isdir(full):
@@ -659,7 +677,7 @@ async def get_tree(project: str):
     return {"name": project, "children": _build_tree(full)}
 
 @app.get("/file")
-async def get_file(p: str = ""):
+def get_file(p: str = ""):
     """Contenu texte d'un fichier du workspace (apercu dans la visionneuse)."""
     full = _safe_workspace_path(p)
     if not full or not os.path.isfile(full):
@@ -685,7 +703,7 @@ async def download_file(p: str = ""):
     return FileResponse(full, filename=os.path.basename(full), media_type="application/octet-stream")
 
 @app.get("/memories")
-async def get_memories(kind: str = "", q: str = "", offset: int = 0):
+def get_memories(kind: str = "", q: str = "", offset: int = 0):
     """Liste des souvenirs, ou test de recherche semantique si q est fourni
     (score abaisse a 0.3 pour le mode 'test' — but different de la vraie injection)."""
     if q.strip():
@@ -695,17 +713,17 @@ async def get_memories(kind: str = "", q: str = "", offset: int = 0):
     return {"mode": "list", **data}
 
 @app.delete("/memories/{mem_id}")
-async def del_memory(mem_id: int):
+def del_memory(mem_id: int):
     mem_delete(mem_id)
     return {"ok": True}
 
 @app.delete("/memories")
-async def purge_memories(kind: str = ""):
+def purge_memories(kind: str = ""):
     mem_purge(kind or None)
     return {"ok": True}
 
 @app.post("/restore/{snapshot_id}")
-async def restore_snapshot(snapshot_id: int):
+def restore_snapshot(snapshot_id: int):
     """Restaure un snapshot precedent (rollback) d'un projet."""
     from skills import _cx
     with _cx() as c:
@@ -717,7 +735,7 @@ async def restore_snapshot(snapshot_id: int):
     return {"ok": ok, "msg": out}
 
 @app.get("/export/{sid}")
-async def export_session(sid: int):
+def export_session(sid: int):
     """Exporte une session en markdown telechargeable."""
     rows = history(sid, 500)
     lines = [f"# DevLLMA — Session #{sid}\n"]
@@ -736,7 +754,8 @@ async def ocr(file: UploadFile = File(...)):
         p = r"C:\Devllma\_chat_ocr_upload.png"
         with open(p, "wb") as f:
             f.write(data)
-        txt = read_image_text(p)
+        # executor : l'OCR = plusieurs secondes de CPU, gelerait tous les WebSockets
+        txt = await asyncio.get_event_loop().run_in_executor(None, read_image_text, p)
         return {"text": txt}
     except Exception as e:
         return {"text": f"(erreur OCR: {e})"}
@@ -754,7 +773,8 @@ async def upload_doc(file: UploadFile = File(...)):
         p = rf"C:\Devllma\_chat_doc_upload{ext}"
         with open(p, "wb") as f:
             f.write(data)
-        txt = read_document(p)
+        # executor : parse DOCX/XLSX/PDF = plusieurs secondes, gelerait tous les WebSockets
+        txt = await asyncio.get_event_loop().run_in_executor(None, read_document, p)
         truncated = len(txt) > 15000
         if truncated:
             txt = txt[:15000] + "\n[... document tronqué ...]"
@@ -763,7 +783,7 @@ async def upload_doc(file: UploadFile = File(...)):
         return {"error": f"lecture du document impossible : {e}"}
 
 @app.get("/search")
-async def search_sessions(q: str = ""):
+def search_sessions(q: str = ""):
     """Recherche plein texte dans l'historique des messages, groupée par session."""
     q = (q or "").strip()
     if len(q) < 2:
@@ -775,7 +795,7 @@ async def search_sessions(q: str = ""):
         return {"results": []}
 
 @app.get("/sessions")
-async def sessions():
+def sessions():
     """Liste les sessions récentes (pour reprendre une session)."""
     try:
         rows = list_sessions()  # (id, title, created_at)
@@ -784,7 +804,7 @@ async def sessions():
         return {"sessions": []}
 
 @app.delete("/sessions/{sid}")
-async def remove_session(sid: int):
+def remove_session(sid: int):
     """Supprime une session (et ses messages/taches)."""
     try:
         delete_session(sid)
@@ -916,8 +936,23 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         await handle_agent(websocket, sid_box, prompt, cancel_event)
         return
 
+    # ── FAST-PATH snippet : une simple fonction/regex demandee dans le chat ne
+    # justifie pas le pipeline projet (plan brain + fichiers + scan + execution
+    # ≈ 90 s mesurees) : on streame directement le coder (~15-30 s). Jamais pour
+    # un projet existant ni une edition — le pipeline garde ces cas.
+    if is_trivial_snippet(prompt) and not match_existing_project(prompt) and not is_edit(prompt):
+        await websocket.send_json({"type":"thinking"})
+        resp = await stream_agent(websocket, "coder", prompt, cancel_event=cancel_event)
+        msg(sid, "coder", "assistant", resp)
+        if not cancel_event.is_set():
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: mem_index("qa", prompt[:80], f"Q: {prompt}\nR: {resp[:600]}"))
+        await websocket.send_json({"type":"done"})
+        return
+
     # ── Charger mémoire brain ─────────────────────────────────────────
-    load_workspace_memory()
+    # executor : sur cache TTL froid le scan disque gelerait la boucle asyncio
+    await asyncio.get_event_loop().run_in_executor(None, load_workspace_memory)
     agents_needed = route(prompt) or ["coder"]
     # Si la demande vise un projet EXISTANT -> on cible SON dossier (pas un nouveau slug)
     matched = match_existing_project(prompt)
@@ -954,7 +989,8 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # ── Phase 2 : Lire le code existant si c'est une modif/reprise ───
     existing = {}
     if editing and os.path.isdir(project_dir):
-        existing = read_project(project_dir)
+        # executor : lecture disque de tout le projet, ne pas geler la boucle asyncio
+        existing = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
     if existing:
         ctx_note = ("\n\nCODE EXISTANT DU PROJET (tu DOIS partir de ce code et le MODIFIER, "
                     "PAS repartir de zéro ; conserve ce qui marche, applique seulement la demande) :\n"
@@ -994,11 +1030,14 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     if files:
         # Snapshot AVANT d'écraser un projet existant (rollback possible)
         if os.path.isdir(project_dir):
-            snap_id, snap_n = SnapshotManager.snapshot(project_dir, label="avant-modif")
+            # executor : la copie de tout le projet peut prendre des secondes
+            snap_id, snap_n = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: SnapshotManager.snapshot(project_dir, label="avant-modif"))
             if snap_id:
                 await websocket.send_json({"type":"snapshot","id":snap_id,"files":snap_n})
 
-        created = write_files(project_dir, files)
+        created = await asyncio.get_event_loop().run_in_executor(
+            None, write_files, project_dir, files)
         for fname in created:
             fp = os.path.join(project_dir, fname)
             kb = round(os.path.getsize(fp)/1024,1) if os.path.exists(fp) else 0
@@ -1024,20 +1063,22 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         # Mettre à jour la mémoire persistante du brain
         BrainMemory.append_event(f"Créé {project_name} ({len(created)} fichiers)")
         BRAIN_MEMORY["session_todos"].append(f"Créé {project_name} ({len(created)} fichiers)")
-        load_workspace_memory()
+        # force=True : on vient d'ecrire des fichiers, le cache TTL doit etre contourne
+        await asyncio.get_event_loop().run_in_executor(None, lambda: load_workspace_memory(force=True))
 
         # ── Pre-verification syntaxe (rapide) avant d'installer/executer ────
         # Evite de gaspiller un cycle complet d'install+execution sur du code qui ne compile meme pas.
         syntax_errs = await asyncio.get_event_loop().run_in_executor(None, syntax_check, project_dir)
         if syntax_errs and not cancel_event.is_set():
             await websocket.send_json({"type":"file_created","name":"⚠ Erreur de syntaxe — correction rapide","size":""})
+            cur = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
             fix_p = ("ERREUR DE SYNTAXE (py_compile):\n" + "\n".join(syntax_errs) +
-                     f"\n\nCODE ACTUEL:\n{format_context(read_project(project_dir))}\n\n"
+                     f"\n\nCODE ACTUEL:\n{format_context(cur)}\n\n"
                      f"Corrige la syntaxe. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
             fix_resp = await stream_agent(websocket, agent_name, fix_p, CODER_FIX_SYSTEM, cancel_event=cancel_event)
             fixed = extract_files(fix_resp)
             if fixed:
-                write_files(project_dir, fixed)
+                await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
 
         # Installer les dépendances
         ok_dep, _ = await asyncio.get_event_loop().run_in_executor(None, install_deps, project_dir)
@@ -1076,7 +1117,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                     # precedente, le modele tourne en rond -> on escalade (temperature plus
                     # haute + consigne explicite de changer d'approche) au lieu de reessayer
                     # a l'identique indefiniment (cf. logique deja presente dans dev_agent.py).
-                    cur_files = read_project(project_dir)
+                    cur_files = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
                     clean_err = extract_error_line(run_out)
                     stuck = stuck + 1 if clean_err == prev_err else 0
                     prev_err = clean_err
@@ -1121,7 +1162,8 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         if old and len(old) > 200 and len(code) < 0.4 * len(old):
                             continue
                         applied.append((fname, code))
-                    if applied: write_files(project_dir, applied)
+                    if applied:
+                        await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, applied)
 
                     run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
                         None, execute_project, project_dir
@@ -1140,8 +1182,8 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         todos[i]["done"]=True; todos[i]["active"]=False
     if todos: await websocket.send_json({"type":"todos","items":todos})
 
-    # Envoyer liste projets mise à jour
-    load_workspace_memory()
+    # Envoyer liste projets mise à jour (force=True : fichiers peut-etre ecrits juste avant)
+    await asyncio.get_event_loop().run_in_executor(None, lambda: load_workspace_memory(force=True))
     await websocket.send_json({"type":"projects","items":[p["name"] for p in BRAIN_MEMORY["projects"]]})
     await websocket.send_json({"type":"done"})
 
@@ -1206,7 +1248,8 @@ async def ws_handler(websocket: WebSocket):
 
             # Envoyer liste projets
             if data["type"] == "get_projects":
-                load_workspace_memory()
+                # executor : sur cache TTL froid le scan disque gelerait la boucle
+                await asyncio.get_event_loop().run_in_executor(None, load_workspace_memory)
                 names = [p["name"] for p in BRAIN_MEMORY["projects"]]
                 await websocket.send_json({"type":"projects","items":names})
                 continue
@@ -1258,6 +1301,11 @@ async def ws_handler(websocket: WebSocket):
                 continue
 
     except WebSocketDisconnect:
+        # Le cancel() asyncio n'atteint pas le thread executor de run_agent_sync :
+        # sans set(), sa boucle ReAct (appels Ollama de plusieurs minutes + outils
+        # a effets de bord) continue en zombie apres fermeture de l'onglet et
+        # bloque l'unique slot de generation CPU pour la session suivante.
+        cancel_event.set()
         worker_task.cancel()
 
 def _startup_warmup():

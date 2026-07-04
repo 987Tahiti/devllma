@@ -121,6 +121,7 @@ async def stream_agent(ws, agent_name, prompt, system=None, cancel_event=None, t
     t0 = time.time()
     ntok = 0
     stopped = False
+    err = None
     await ws.send_json({"type":"agent_start","agent":agent_name})
 
     loop = asyncio.get_event_loop()
@@ -140,7 +141,9 @@ async def stream_agent(ws, agent_name, prompt, system=None, cancel_event=None, t
             except _queue.Empty:
                 continue
             if kind == "error":
-                await ws.send_json({"type":"token","text":f"\nErreur: {payload}"})
+                # pas d'envoi de token ici : le worker de webui.py affichera le
+                # message UNE seule fois en attrapant l'exception levee plus bas
+                err = payload
                 break
             if kind in ("end", "stopped"):
                 if kind == "stopped":
@@ -161,6 +164,11 @@ async def stream_agent(ws, agent_name, prompt, system=None, cancel_event=None, t
     finally:
         stop_flag.set()
         th.join(timeout=2)
+    # une panne Ollama mid-stream doit remonter en exception, sinon le pipeline
+    # ecrit du code tronque puis boucle en auto-correction contre un serveur mort.
+    # Le cas 'stopped' (annulation volontaire) reste inchange : jamais de raise.
+    if err:
+        raise RuntimeError(err)
     if stopped:
         await ws.send_json({"type":"stopped"})
     return full

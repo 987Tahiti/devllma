@@ -153,6 +153,59 @@ def stats():
             'memories': c.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
         }
 
+# ── Cache RAM des embeddings ─────────────────────────────────────────────────
+# json.loads() de N vecteurs de 768 floats a CHAQUE mem_search coute lineairement
+# avec la taille de la memoire. On garde donc en RAM une matrice numpy
+# PRE-NORMALISEE (lignes de norme 1 : la similarite cosinus devient un simple
+# produit matrice-vecteur) + les metadonnees alignees. Invalidation par compteur
+# de generation : chaque ecriture (mem_index reussie, mem_delete, mem_purge)
+# incremente _mem_gen ; mem_search reconstruit si son cache est plus ancien.
+# NOTE inter-process : le compteur est local au process. Si un AUTRE process
+# ouvre la meme base (instance prod + instance de test, ou seed_knowledge.py
+# lance pendant qu'un serveur tourne), ses ecritures ne seront vues ici qu'a la
+# prochaine ecriture locale (en pratique au premier QA indexe). Acceptable :
+# chaque process relit ce qu'il ecrit lui-meme, et la memoire semantique tolere
+# cette staleness. Le chemin dedup de mem_index n'invalide pas (aucune ecriture).
+import threading
+_mem_gen = 0
+_mem_cache = {"gen": -1, "mat": None, "meta": []}  # meta: [(kind, ref_name, chunk)]
+_mem_lock = threading.Lock()  # mem_search tourne dans des threads (run_in_executor cote webui)
+
+def _mem_invalidate():
+    global _mem_gen
+    with _mem_lock:
+        _mem_gen += 1
+
+def _mem_matrix():
+    """(matrice normalisee, meta) depuis le cache ; reconstruit apres une ecriture."""
+    import numpy as np
+    with _mem_lock:
+        if _mem_cache["gen"] == _mem_gen and _mem_cache["mat"] is not None:
+            return _mem_cache["mat"], _mem_cache["meta"]
+        gen = _mem_gen  # capture AVANT le SELECT : une ecriture concurrente re-invalidera
+        with cx() as c:
+            rows = c.execute("SELECT kind,ref_name,chunk,vector FROM embeddings").fetchall()
+        meta, vecs, dim = [], [], None
+        for knd, ref_name, chunk, vecjson in rows:
+            try:
+                v = json.loads(vecjson)
+            except Exception:
+                continue
+            if dim is None:
+                dim = len(v)
+            if len(v) != dim:  # vecteur d'un autre modele d'embedding : ignore plutot que crash
+                continue
+            vecs.append(v)
+            meta.append((knd, ref_name, chunk))
+        if not vecs:
+            _mem_cache.update(gen=gen, mat=np.zeros((0, 1), dtype=np.float32), meta=[])
+        else:
+            mat = np.asarray(vecs, dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1e-9
+            _mem_cache.update(gen=gen, mat=mat / norms, meta=meta)
+        return _mem_cache["mat"], _mem_cache["meta"]
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Memoire semantique (RAG) — via nomic-embed-text, recherche par similarite
 # ════════════════════════════════════════════════════════════════════════════
@@ -182,9 +235,14 @@ def mem_index(kind, ref_name, text, ref_id=None):
     if not vec:
         return None
     with cx() as c:
-        return c.execute(
+        rid = c.execute(
             "INSERT INTO embeddings(kind,ref_id,ref_name,chunk,vector) VALUES(?,?,?,?,?)",
             (kind, ref_id, ref_name, text[:2000], json.dumps(vec))).lastrowid
+    # HORS du with : l'invalidation doit suivre le COMMIT (sortie du with), sinon un
+    # mem_search concurrent pourrait reconstruire le cache sur les donnees d'avant
+    # tout en enregistrant la generation d'apres -> cache perime en permanence.
+    _mem_invalidate()
+    return rid
 
 def mem_list(kind=None, limit=100, offset=0):
     """Liste paginee des souvenirs, du plus recent au plus ancien (panneau memoire UI)."""
@@ -205,6 +263,7 @@ def mem_list(kind=None, limit=100, offset=0):
 def mem_delete(mem_id):
     with cx() as c:
         c.execute("DELETE FROM embeddings WHERE id=?", (mem_id,))
+    _mem_invalidate()  # apres le commit (sortie du with), cf. mem_index
 
 def mem_purge(kind=None):
     with cx() as c:
@@ -212,44 +271,30 @@ def mem_purge(kind=None):
             c.execute("DELETE FROM embeddings WHERE kind=?", (kind,))
         else:
             c.execute("DELETE FROM embeddings")
+    _mem_invalidate()  # apres le commit (sortie du with), cf. mem_index
 
 def mem_search(query, k=5, kind=None, min_score=0.55):
     """Recherche semantique: renvoie les k souvenirs les plus proches de query.
     -> [{kind, ref_name, chunk, score}], tries par pertinence decroissante.
-    Similarite cosinus vectorisee (numpy) plutot qu'une boucle Python."""
+    Matrice servie par le cache RAM (_mem_matrix) : plus de rechargement/parse
+    JSON de toute la table a chaque appel. Le filtre kind se fait en Python
+    apres scoring pour qu'une seule matrice cache serve tous les appels."""
     import numpy as np
     qv = embed(query)
     if not qv:
         return []
-    with cx() as c:
-        if kind:
-            rows = c.execute("SELECT kind,ref_name,chunk,vector FROM embeddings WHERE kind=?", (kind,)).fetchall()
-        else:
-            rows = c.execute("SELECT kind,ref_name,chunk,vector FROM embeddings").fetchall()
-    if not rows:
+    mat, meta = _mem_matrix()
+    if mat.shape[0] == 0:
         return []
-    meta, vecs = [], []
-    for knd, ref_name, chunk, vecjson in rows:
-        try:
-            vecs.append(json.loads(vecjson))
-            meta.append((knd, ref_name, chunk))
-        except Exception:
-            continue
-    if not vecs:
-        return []
-    try:
-        q = np.asarray(qv, dtype=np.float32)
-        mat = np.asarray(vecs, dtype=np.float32)
-        qn = np.linalg.norm(q)
-        norms = np.linalg.norm(mat, axis=1)
-        norms[norms == 0] = 1e-9
-        sims = (mat @ q) / (norms * (qn if qn else 1e-9))
-    except ValueError:
-        return []  # dimensions incoherentes (embeddings d'un autre modele) -> pas de resultat plutot qu'un crash
+    q = np.asarray(qv, dtype=np.float32)
+    if q.shape[0] != mat.shape[1]:
+        return []  # dimension incoherente (modele d'embedding change) -> vide plutot qu'un crash
+    qn = np.linalg.norm(q)
+    sims = mat @ (q / (qn if qn else 1e-9))
     scored = []
     for i, score in enumerate(sims.tolist()):
         knd, ref_name, chunk = meta[i]
-        if score >= min_score:
+        if score >= min_score and (kind is None or knd == kind):
             scored.append({"kind": knd, "ref_name": ref_name, "chunk": chunk, "score": round(score, 3)})
     scored.sort(key=lambda x: -x["score"])
     return scored[:k]

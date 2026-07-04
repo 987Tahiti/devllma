@@ -145,6 +145,34 @@ def has_dev_keywords(prompt):
     low = strip_accents(prompt.lower())
     return any(any(_kw_match(k, low) for k in kws) for kws in ROUTING.values())
 
+# ─── Fast-path snippet ───────────────────────────────────────────────────────
+# Marqueurs d'un SNIPPET ponctuel (une fonction/regex/exemple isole a montrer dans le chat).
+_SNIPPET_RE = re.compile(r'\b(fonctions?|methodes?|snippet|one[- ]?liner|regex|expression reguliere|exemple de code|extrait de code|algorithme)\b')
+# Marqueurs d'un VRAI livrable -> pipeline projet complet obligatoire. Volontairement
+# large (biais vers les faux negatifs : un snippet route vers le pipeline = statu quo
+# acceptable ; un projet traite comme snippet = tres penalisant). "script"/"programme"/
+# "fichier" DOIVENT rester ici : le test "dev" d'eval_agent.py exige project_done pour
+# "Cree un script python calculatrice_eval...".
+_PROJECT_RE = re.compile(
+    r'\b(projet|application|app|site|jeu|bot|logiciel|serveur|api|backend|frontend|'
+    r'interface|dashboard|tableau de bord|page|gui|fenetre|script|programme|fichier|'
+    r'dossier|docker|deploiement|deploie|base de donnees|bdd|plusieurs|module|package|'
+    r'installe|execute|lance|pytest|tests?\b|sauvegarde|enregistre|bureau|desktop)')
+# Nom de fichier explicite (utils.py, index.html...) = l'utilisateur veut un fichier ecrit.
+_FILENAME_RE = re.compile(r'\b[\w-]+\.(py|js|ts|html|css|json|txt|md|csv|sql|bat|ps1|sh|docx|xlsx|pdf)\b')
+
+def is_trivial_snippet(prompt):
+    """Vrai si la demande de dev est un simple snippet (une fonction/regex/exemple)
+    qui merite un streaming direct du coder (~15-30 s) au lieu du pipeline projet
+    complet (~90 s mesurees). AUCUN appel LLM : regex uniquement. En cas de doute,
+    retourne False (le pipeline sait tout faire, l'inverse non)."""
+    low = strip_accents(prompt.lower())
+    if len(low) > 220:                      # demande longue = specification/code colle -> pipeline
+        return False
+    if not _SNIPPET_RE.search(low):
+        return False
+    return not (_PROJECT_RE.search(low) or _FILENAME_RE.search(low))
+
 ROUTING = {
   "architect": ["architecture","conception","design","structure","schema","diagramme","uml"],
   "coder":     ["code","ecris","implemente","fonction","script","programme","cree","fais","genere","develop","python","javascript","java"],
