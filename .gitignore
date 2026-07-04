@@ -1,0 +1,62 @@
+# Donnees personnelles / historique reel — jamais dans le depot
+database/
+vault.db
+workspace/
+backups/
+logs/
+.claude/
+.vscode/
+
+# Specs de test contenant des identifiants FACTICES (mais qui ressemblent a de
+# vrais secrets et declenchent les scanners de secrets GitHub)
+spec_vault.json
+spec_idm.json
+spec_logs.json
+_dev_spec_*.json.out
+
+# Scripts de diagnostic ponctuels (historique de debogage, pas le moteur)
+_captest.py
+_dialog_test.py
+_dispatch_project.py
+_matchtest.py
+_ocrprobe.py
+_ocrtest.py
+_qtest.py
+_run2.py
+_startchk.py
+_stest.py
+_wstest.py
+idm_test.py
+test_competence.py
+screen_agent.py
+aider.cmd
+openinterpreter.cmd
+_pull.ps1
+_pull_ocr.ps1
+_run_devagent.ps1
+_run_queue.ps1
+
+# Sauvegardes obsoletes deja remplacees par la version courante
+webui_backup_v4.py
+webui_backup_v5a.py
+webui_backup_v5b_20260701.py
+
+# Logs volumineux et artefacts binaires de test
+*.log
+_dev_dbg_err.txt
+_dev_dbg_out.txt
+_devagent_boot.txt
+_screen_status.txt
+_screen.jpg
+_ocr_probe.png
+_ocrtest.png
+_chat_ocr_upload.png
+_chat_doc_upload.docx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Artefacts d'evaluation locaux
+eval_results.json
