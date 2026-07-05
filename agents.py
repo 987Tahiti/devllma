@@ -129,6 +129,11 @@ _QUESTION_STARTERS = (
     "explique","resume","compare","cherche","recherche","trouve moi","trouve-moi",
     "actualite","derniere version","derniere nouvelle","quelle est","quel est","donne moi des infos",
     "parle moi de","parle-moi de","qui gagne","quel est le prix","quelle heure","quelle date",
+    # Questions de CAPACITE ("peux-tu generer des images ?") : sans ca, "genere/images" fait
+    # partir la demande dans le pipeline projet, qui construit un outil au lieu de repondre.
+    "peux-tu","peux tu","peut tu","pourrais-tu","pourrais tu","sais-tu","sais tu","saurais-tu",
+    "es-tu capable","es tu capable","as-tu","as tu","est-il possible","est il possible",
+    "est-ce possible","est ce possible","peux tu me","peux-tu me",
 )
 
 def is_research_question(prompt):

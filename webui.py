@@ -246,10 +246,19 @@ def write_files(project_dir, files):
 def install_deps(project_dir):
     req = os.path.join(project_dir, "requirements.txt")
     if not os.path.exists(req): return None, None
-    r = subprocess.run([PYTHON,"-m","pip","install","-r",req,"-q","--no-warn-script-location"],
-                       capture_output=True, text=True, timeout=120,
-                       encoding="utf-8", errors="replace")
-    return r.returncode==0, (r.stdout+r.stderr).strip()[:200]
+    try:
+        r = subprocess.run([PYTHON,"-m","pip","install","-r",req,"-q","--no-warn-script-location"],
+                           capture_output=True, text=True, timeout=600,
+                           encoding="utf-8", errors="replace")
+        return r.returncode==0, (r.stdout+r.stderr).strip()[:200]
+    except subprocess.TimeoutExpired:
+        # Des paquets lourds (torch, diffusers, transformers...) peuvent depasser meme 600s.
+        # Ne PAS laisser l'exception faire ECHOUER TOUT le pipeline (constate : un projet
+        # correct affiche en "Erreur ... timed out") : le projet est cree, on informe et on
+        # continue. L'utilisateur installera manuellement si besoin.
+        return False, "dépendances trop longues à installer (>10 min) — projet créé ; lance 'pip install -r requirements.txt' à la main si nécessaire"
+    except Exception as e:
+        return False, f"installation interrompue : {str(e)[:150]}"
 
 # Nom d'import != nom du paquet PyPI (les cas courants ou pip install <import> echouerait)
 _PIP_ALIAS = {"cv2":"opencv-python","PIL":"pillow","yaml":"pyyaml","bs4":"beautifulsoup4",
