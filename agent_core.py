@@ -37,6 +37,13 @@ KEEP_ALIVE = -1
 # charge le modele en premier sans num_ctx, il retombe au defaut 4096 (constate apres reboot).
 NUM_CTX = 32768
 MAX_STEPS = 8
+# Modele VISION (multimodal) : lit ET comprend une image (captures, schemas, photos),
+# la ou l'OCR ne rend que le texte brut. Opt-in via le parametre `question` de read_image
+# pour ne pas ralentir le cas courant (lecture de texte = OCR, instantane). keep_alive=0 :
+# le modele vision (~6 Go) se decharge apres usage pour ne PAS evincer le coder 30b
+# garde chaud en permanence (RAM limitee sur ce poste).
+VISION_MODEL = "qwen2.5vl:7b"
+VISION_KEEP_ALIVE = 0
 
 # Chemins REELS resolus dynamiquement (meme process/compte que le service DevLLMA) —
 # sans ca, le modele hallucine des chemins generiques ("C:\Users\Utilisateur\...")
@@ -188,9 +195,10 @@ TOOLS = [
     }},
     {"type":"function","function":{
         "name":"read_image",
-        "description":"Lit le texte d'une image (.png/.jpg, capture d'ecran...) par OCR local.",
+        "description":"Lit une image (.png/.jpg, capture d'ecran...). Sans question : OCR local (texte brut, rapide). Avec 'question' : un modele vision DECRIT et interprete reellement l'image (contenu, schema, UI, graphe) et repond a la question.",
         "parameters":{"type":"object","properties":{
-            "path":{"type":"string"}
+            "path":{"type":"string"},
+            "question":{"type":"string","description":"optionnel : ce qu'on veut savoir sur l'image (declenche l'analyse visuelle au lieu du simple OCR)"}
         },"required":["path"]}
     }},
     {"type":"function","function":{
@@ -683,14 +691,45 @@ def _tool_read_image(args):
     ext = os.path.splitext(path)[1].lower()
     if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"):
         return {"error": "ce n'est pas une image — utilise read_file pour les documents texte/Office/PDF"}
+    # Avec une question -> analyse VISUELLE (comprend le contenu), sinon OCR (texte brut, rapide).
+    question = (args.get("question") or "").strip()
+    if question:
+        res = _vision_read(path, question)
+        if res is not None:              # None = vision indisponible -> repli OCR ci-dessous
+            return res
     from tools import read_image_text  # lazy : le moteur OCR ne se charge qu'au 1er usage
     try:
         text = read_image_text(path) or ""
     except Exception as e:
         return {"error": f"OCR impossible : {e}"}
     if not text.strip():
-        return {"text": "", "note": "aucun texte detecte dans l'image", "path": path}
+        return {"text": "", "note": "aucun texte detecte dans l'image (essaie avec une 'question' pour l'analyse visuelle)", "path": path}
     return {"text": text[:3500], "truncated": len(text) > 3500, "path": path}
+
+def _vision_read(path, question):
+    """Analyse une image avec le modele vision (qwen2.5vl). Retourne {description,...} ou
+    None si le modele est indisponible (l'appelant retombe alors sur l'OCR). Le modele se
+    decharge apres usage (keep_alive=0) pour ne pas evincer le coder garde en RAM."""
+    import base64
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except Exception as e:
+        return {"error": f"lecture image impossible : {e}"}
+    try:
+        r = _http.post(OLLAMA + "/api/generate", json={
+            "model": VISION_MODEL,
+            "prompt": question + "\n\nDecris precisement ce que montre l'image et retranscris tout texte visible. Reponds en francais.",
+            "images": [b64], "stream": False, "keep_alive": VISION_KEEP_ALIVE,
+            "options": {"temperature": 0.2, "num_predict": 700},
+        }, timeout=300)
+        body = r.json()
+        if "error" in body:   # modele non installe / autre -> repli OCR
+            return None
+        desc = (body.get("response") or "").strip()
+        return {"description": desc[:3500], "path": path, "mode": "vision"} if desc else None
+    except Exception:
+        return None  # vision KO -> repli OCR
 
 def _tool_http_request(args):
     url = (args.get("url") or "").strip()
