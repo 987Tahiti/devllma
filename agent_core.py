@@ -32,6 +32,10 @@ AGENT_MODEL = "qwen3-coder:30b"
 # cache KV chaud — un dechargement apres 30 min d'inactivite rendait la
 # premiere reponse suivante inutilisable.
 KEEP_ALIVE = -1
+# Meme fenetre de contexte que ollama_client.NUM_CTX : le modele est partage (brain/coder/
+# agent) et keep_alive=-1 le fige au num_ctx du premier chargeur. Si le warmup de l'agent
+# charge le modele en premier sans num_ctx, il retombe au defaut 4096 (constate apres reboot).
+NUM_CTX = 32768
 MAX_STEPS = 8
 
 # Chemins REELS resolus dynamiquement (meme process/compte que le service DevLLMA) —
@@ -884,7 +888,7 @@ def warm_agent_cache():
             "messages": [{"role": "system", "content": AGENT_SYSTEM},
                           {"role": "user", "content": "ping"}],
             "tools": TOOLS, "stream": False, "keep_alive": KEEP_ALIVE,
-            "options": {"num_predict": 1},
+            "options": {"num_predict": 1, "num_ctx": NUM_CTX},  # fixe le contexte des le warmup
         }, timeout=600)
         return True
     except Exception:
@@ -897,7 +901,7 @@ def _chat_call(messages, tools=None, temperature=0.3):
         "messages": messages,
         "stream": False,
         "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": temperature},
+        "options": {"temperature": temperature, "num_ctx": NUM_CTX},
     }
     if tools:
         payload["tools"] = tools

@@ -20,6 +20,12 @@ from db import EMBED_MODEL
 # Garde le modèle chargé en RAM en PERMANENCE (-1) : le recharger + réévaluer les
 # prompts à froid coûte plusieurs minutes sur ce CPU (mesure, cf agent_core.KEEP_ALIVE).
 KEEP_ALIVE = -1
+# Fenetre de contexte forcee. Avec keep_alive=-1 le modele reste charge avec le num_ctx
+# du PREMIER appel qui le charge ; si personne ne le fixe, Ollama retombe sur son defaut
+# (4096 constate apres un reboot) -> generation multi-fichiers bridee et lente. On impose
+# 32768 partout (warmup + generation) pour un contexte stable, valeur qui tournait deja
+# sur ce poste avant reboot (RAM suffisante).
+NUM_CTX = 32768
 # Modèle du Brain : qwen3-coder:30b (MoE, ~3.3B actifs/token -> aussi rapide qu'un 7b dense
 # mais bien plus capable ; mesuré ~2x plus rapide que qwen2.5-coder:7b sur ce CPU, cf bench_models.py)
 BRAIN_MODEL = "qwen3-coder:30b"
@@ -39,7 +45,7 @@ def call_brain(prompt, system=None, max_tokens=450):
             r = _http.post(OLLAMA+"/api/generate", json={
                 "model":BRAIN_MODEL, "system":s,
                 "prompt":prompt, "stream":False, "keep_alive":KEEP_ALIVE,
-                "options":{"temperature":0.3,"num_predict":max_tokens}
+                "options":{"temperature":0.3,"num_predict":max_tokens,"num_ctx":NUM_CTX}
             }, timeout=300)
             body = r.json()
             if "error" in body:
@@ -59,7 +65,8 @@ def preload_models():
     for m in {active, BRAIN_MODEL}:
         try:
             _http.post(OLLAMA+"/api/generate",
-                          json={"model":m,"prompt":"","keep_alive":KEEP_ALIVE},
+                          json={"model":m,"prompt":"","keep_alive":KEEP_ALIVE,
+                                "options":{"num_ctx":NUM_CTX}},  # charge le modele au bon contexte des le warmup
                           timeout=120)
         except Exception:
             pass
@@ -76,7 +83,7 @@ def _ollama_stream_worker(cfg, sys_p, prompt, out_q, stop_flag, temperature=0.2)
                 r = _http.post(OLLAMA+"/api/generate", json={
                     "model":cfg["model"], "system":sys_p,
                     "prompt":prompt, "stream":True, "keep_alive":KEEP_ALIVE,
-                    "options":{"temperature":temperature,"num_predict":4000}
+                    "options":{"temperature":temperature,"num_predict":4000,"num_ctx":NUM_CTX}
                 }, stream=True, timeout=(10, 600))
                 break
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
