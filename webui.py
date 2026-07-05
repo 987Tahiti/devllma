@@ -930,14 +930,27 @@ TOOL_LABELS = {
     "open_path": "ouverture",
 }
 
+CONV_WINDOW = 12  # nb de messages recents passes au modele comme contexte conversationnel.
+                  # 12 (~1500-1800 car tronques -> ~500 tokens) : assez pour suivre un fil
+                  # ("ajoute un mode sombre a ce que tu viens de faire") sans peser lourd dans
+                  # num_ctx=32768 (cout d'eval marginal sur ce CPU, mesure).
+
+def _history_text(sid, current_prompt, n=CONV_WINDOW):
+    """Derniers n echanges (HORS message courant) formates pour donner au modele le fil de la
+    conversation. Le message courant vient d'etre enregistre par msg() -> on le retire pour
+    ne pas le dupliquer avec la DEMANDE. Chaque message tronque a 150 car (borne le cout)."""
+    rows = history(sid, n + 1)
+    if rows and rows[-1][1] == "user" and rows[-1][2][:150] == current_prompt[:150]:
+        rows = rows[:-1]
+    return "\n".join(f"[{r[0].upper()}]: {r[2][:150]}" for r in rows) if rows else ""
+
 async def handle_agent(websocket, sid_box, prompt, cancel_event):
     """Agent generaliste a outils (type Claude Code) : gere tout ce qui n'est pas une grosse
     tache de generation de projet (questions, recherche, actions systeme, fichiers ponctuels,
     memoire) en decidant lui-meme, etape par etape, quel outil utiliser. Remplace les anciens
     chemins figes handle_chat/handle_research/action-systeme."""
     sid = sid_box["sid"]
-    hist = history(sid, 6)
-    history_text = "\n".join(f"[{h[0].upper()}]: {h[2][:150]}" for h in hist) if hist else ""
+    history_text = _history_text(sid, prompt)
 
     await websocket.send_json({"type":"thinking"})
     await websocket.send_json({"type":"agent_start","agent":"agent"})
@@ -1093,9 +1106,15 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             f"- [{m['kind']}] {m['ref_name']}: {m['chunk'][:200]}" for m in memories)
         await websocket.send_json({"type":"memory","items":[{"ref":m["ref_name"],"score":m["score"]} for m in memories]})
 
+    # ── Contexte conversationnel : le pipeline projet suit maintenant le fil du chat
+    # (avant, seul l'agent generaliste l'avait) -> "ajoute X au projet precedent",
+    # "reprends l'idee d'avant" fonctionnent sans re-decrire tout le contexte.
+    conv = _history_text(sid, prompt)
+    conv_note = f"\n\nCONVERSATION RECENTE (contexte ; la demande a traiter est ci-dessus):\n{conv}" if conv else ""
+
     # ── Phase 1 : Brain pense et planifie ────────────────────────────
     await websocket.send_json({"type":"thinking"})
-    plan = await asyncio.get_event_loop().run_in_executor(None, call_brain, prompt + mem_note)
+    plan = await asyncio.get_event_loop().run_in_executor(None, call_brain, prompt + conv_note + mem_note)
     if cancel_event.is_set():
         await websocket.send_json({"type":"stopped"}); await websocket.send_json({"type":"done"}); return
     await websocket.send_json({"type":"agent_start","agent":"brain"})
@@ -1128,7 +1147,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                 if existing else "Crée TOUS les fichiers nécessaires (main.py en premier). Code prêt à lancer.")
     enriched = (
         f"PLAN DU BRAIN:\n{plan}\n\n"
-        f"DEMANDE: {prompt}{ctx_note}{mem_note}\n\n"
+        f"DEMANDE: {prompt}{ctx_note}{conv_note}{mem_note}\n\n"
         f"Projet: C:\\Devllma\\workspace\\{project_name}\\\n"
         f"Produis chaque fichier au format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE\n"
         f"{consigne}"
