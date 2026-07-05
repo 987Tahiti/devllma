@@ -382,7 +382,27 @@ def execute_project(project_dir, timeout=15):
             _kill_process_tree(proc.pid)
         return False, str(e), ep
 
+def _explicit_project_name(text):
+    """Nom de projet donne EXPLICITEMENT par l'utilisateur, sinon None.
+    Sans ca, deux demandes aux 4 premiers mots identiques (ex: "Cree une application
+    Windows de bureau : projet 'X'") produisent le meme slug et le second projet
+    ECRASE le premier (bug constate: 3 apps GUI ecrites dans un seul dossier).
+    On ne prend les guillemets SIMPLES qu'apres un marqueur (projet/appele/nomme...) :
+    un ' isole est le plus souvent une apostrophe francaise (l'appli, d'unites)."""
+    m = re.search(r"(?:projets?|programmes?|applications?|appli|app|logiciels?|jeux?|"
+                  r"nomm[ee]+|appel[ee]+|intitul[ee]+)\s*[:=]?\s*['\"«“]([^'\"»”\n]{2,40})['\"»”]",
+                  text, re.IGNORECASE)
+    if not m:  # repli : uniquement guillemets doubles / francais (jamais l'apostrophe)
+        m = re.search(r"[\"«“]([^\"»”\n]{2,40})[\"»”]", text)
+    return m.group(1).strip() if m else None
+
 def slug(text):
+    name = _explicit_project_name(text)
+    if name:
+        s = re.sub(r"[^\w\s-]", "", strip_accents(name).lower())
+        s = re.sub(r"[\s-]+", "_", s).strip("_")
+        if s:
+            return s[:40]
     text=re.sub(r"(?:crée|cree|créer|creer|fais|fait|génère|genere|développe|developpe|écris|ecris)\s+","",text.lower())
     text=re.sub(r"(?:moi|un|une|le|la|les|des|du|avec|pour|en|et|ou|de)\s+"," ",text)
     text=re.sub(r"[^\w\s]","",text).strip()
@@ -963,6 +983,16 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         project_name = slug(prompt)
         editing = is_edit(prompt)
     project_dir = os.path.join(WORKSPACE, project_name)
+
+    # ── Anti-ecrasement : une CREATION neuve (ni projet existant cible, ni edition)
+    # ne doit jamais reutiliser un dossier deja peuple -> suffixe _2, _3... Sans ca,
+    # deux demandes au meme slug s'ecrasent silencieusement (perte de donnees).
+    if not matched and not editing and os.path.isdir(project_dir) and os.listdir(project_dir):
+        base, i = project_name, 2
+        while os.path.isdir(project_dir) and os.listdir(project_dir):
+            project_name = f"{base}_{i}"
+            project_dir = os.path.join(WORKSPACE, project_name)
+            i += 1
 
     # ── Phase 0 : Mémoire sémantique — souvenirs pertinents (RAG) ────────
     memories = await asyncio.get_event_loop().run_in_executor(None, lambda: mem_search(prompt, 3))
