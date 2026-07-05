@@ -4,7 +4,11 @@ from datetime import datetime
 
 DB = r"C:\Devllma\database\devllma.db"
 OLLAMA = "http://localhost:11434"
-EMBED_MODEL = "nomic-embed-text"
+# snowflake-arctic-embed2 : embedding MULTILINGUE (1024 dims) nettement meilleur que
+# nomic-embed-text (768 dims, anglophone) sur les souvenirs en francais. Changer ce modele
+# rend illisibles les vecteurs de l'ancien (dimensions differentes) -> mem_search les ignore
+# proprement, et il faut RE-INDEXER l'existant (reindex_embeddings ci-dessous, lance une fois).
+EMBED_MODEL = "snowflake-arctic-embed2"
 # Session partagee (connexion TCP + keep-alive reutilises) : embed() est appele a
 # CHAQUE mem_search/mem_index, une nouvelle connexion a chaque fois est un cout
 # evitable meme en local.
@@ -210,15 +214,34 @@ def _mem_matrix():
 #  Memoire semantique (RAG) — via nomic-embed-text, recherche par similarite
 # ════════════════════════════════════════════════════════════════════════════
 def embed(text):
-    """Calcule le vecteur d'un texte via Ollama (nomic-embed-text). None si indisponible."""
+    """Calcule le vecteur d'un texte via Ollama (EMBED_MODEL). None si indisponible."""
     try:
         r = _http.post(f"{OLLAMA}/api/embeddings",
                           json={"model": EMBED_MODEL, "prompt": text[:6000]},
-                          timeout=30)
+                          timeout=60)
         vec = r.json().get("embedding")
         return vec if vec else None
     except Exception:
         return None
+
+def reindex_embeddings():
+    """Recalcule TOUS les vecteurs avec le modele EMBED_MODEL courant (a lancer une fois
+    apres un changement de modele : les anciens vecteurs, d'une autre dimension, sont sinon
+    ignores par mem_search). Idempotent : re-lancer ne fait que recalculer. Le texte source
+    (colonne chunk) est deja stocke -> pas besoin des documents d'origine.
+    Retourne (ok, total, echecs)."""
+    with cx() as c:
+        rows = c.execute("SELECT id, chunk FROM embeddings").fetchall()
+    ok = fail = 0
+    for eid, chunk in rows:
+        vec = embed(chunk)
+        if not vec:
+            fail += 1
+            continue
+        with cx() as c:
+            c.execute("UPDATE embeddings SET vector=? WHERE id=?", (json.dumps(vec), eid))
+        ok += 1
+    return ok, len(rows), fail
 
 def mem_index(kind, ref_name, text, ref_id=None):
     """Indexe un texte (tache, artifact, fichier projet...) pour recherche semantique future."""
@@ -273,7 +296,11 @@ def mem_purge(kind=None):
             c.execute("DELETE FROM embeddings")
     _mem_invalidate()  # apres le commit (sortie du with), cf. mem_index
 
-def mem_search(query, k=5, kind=None, min_score=0.55):
+# Seuil de similarite par defaut. Calibre pour snowflake-arctic-embed2 : ses scores cosinus
+# sont sur une echelle plus BASSE que nomic-embed-text (un match pertinent sort ~0.45-0.50,
+# pas ~0.55-0.70) -> un seuil a 0.55 rejetait TOUT (mesure). 0.40 capte les vrais matchs
+# sans laisser passer trop de bruit.
+def mem_search(query, k=5, kind=None, min_score=0.40):
     """Recherche semantique: renvoie les k souvenirs les plus proches de query.
     -> [{kind, ref_name, chunk, score}], tries par pertinence decroissante.
     Matrice servie par le cache RAM (_mem_matrix) : plus de rechargement/parse
