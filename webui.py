@@ -251,6 +251,60 @@ def install_deps(project_dir):
                        encoding="utf-8", errors="replace")
     return r.returncode==0, (r.stdout+r.stderr).strip()[:200]
 
+# Nom d'import != nom du paquet PyPI (les cas courants ou pip install <import> echouerait)
+_PIP_ALIAS = {"cv2":"opencv-python","PIL":"pillow","yaml":"pyyaml","bs4":"beautifulsoup4",
+              "sklearn":"scikit-learn","dotenv":"python-dotenv","dateutil":"python-dateutil",
+              "serial":"pyserial","Crypto":"pycryptodome","OpenGL":"PyOpenGL"}
+
+def derive_requirements(project_dir):
+    """Complete requirements.txt en analysant les imports (AST), SANS appel LLM : le modele
+    oublie souvent ce fichier -> ModuleNotFoundError au lancement. On ne deduit que les
+    paquets pip EXTERNES (retire la stdlib et les modules locaux du projet) et on n'AJOUTE
+    que les manquants (jamais d'ecrasement d'un requirements.txt existant). Retourne la liste
+    ajoutee."""
+    import ast
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    ignore = {"__pycache__", ".git", "node_modules", ".venv", "build", "dist"}
+    local, py_files = set(), []
+    for root, dirs, names in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in ignore]
+        for n in names:
+            if n.endswith(".py"):
+                py_files.append(os.path.join(root, n)); local.add(n[:-3])
+        if root == project_dir:
+            local.update(dirs)  # dossiers-paquets a la racine = modules locaux
+    found = set()
+    for fp in py_files:
+        try:
+            tree = ast.parse(open(fp, encoding="utf-8", errors="replace").read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names: found.add(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])  # level==0 => ignore les imports relatifs
+    external = [_PIP_ALIAS.get(m, m) for m in sorted(found)
+                if m and m not in stdlib and m not in local]
+    if not external:
+        return []
+    req_path = os.path.join(project_dir, "requirements.txt")
+    existing_text = ""
+    if os.path.exists(req_path):
+        try: existing_text = open(req_path, encoding="utf-8").read()
+        except Exception: existing_text = ""
+    have = {re.split(r'[<>=!~ ]', l.strip())[0].lower() for l in existing_text.splitlines() if l.strip()}
+    missing = [p for p in external if p.lower() not in have]
+    if not missing:
+        return []
+    sep = "" if (not existing_text or existing_text.endswith("\n")) else "\n"
+    try:
+        with open(req_path, "a", encoding="utf-8") as f:
+            f.write(sep + "\n".join(missing) + "\n")
+    except Exception:
+        return []
+    return missing
+
 bootstrap_memory()
 
 # ─── Exécution de code ────────────────────────────────────────────────────────
@@ -293,10 +347,12 @@ SERVER_MARKERS = ("uvicorn", "flask", "app.run(", "socketserver", "http.server",
                    "runserver", "waitress", "gunicorn", "websockets.serve")
 
 def _detect_server_port(project_dir):
-    """Devine le port qu'un projet serveur va essayer d'ouvrir en scannant son code
-    (sinon on ne peut pas verifier reellement qu'il a demarre)."""
-    port = None
+    """Devine le(s) port(s) qu'un projet serveur va ouvrir en scannant son code.
+    Retourne (is_server, [ports candidats]). On collecte TOUS les `port=` (pas juste
+    le premier) + des defauts par framework, car un projet peut definir le port
+    ailleurs que dans une 1re ligne evidente. 8080 (PROD) est exclu par securite."""
     is_server = False
+    ports, frameworks = [], set()
     for root, dirs, names in os.walk(project_dir):
         dirs[:] = [d for d in dirs if d not in {"__pycache__",".git","node_modules",".venv","build","dist"}]
         for n in names:
@@ -307,12 +363,21 @@ def _detect_server_port(project_dir):
             except Exception:
                 continue
             low = content.lower()
-            if any(mk in low for mk in SERVER_MARKERS):
-                is_server = True
-            m = re.search(r'port\s*=\s*(\d{2,5})', content)
-            if m and port is None:
-                port = int(m.group(1))
-    return is_server, (port or 8000)
+            for mk in SERVER_MARKERS:
+                if mk in low:
+                    is_server = True; frameworks.add(mk)
+            for m in re.findall(r'port\s*=\s*(\d{2,5})', content):
+                p = int(m)
+                if p != 8080 and p not in ports:  # 8080 = PROD, jamais un projet genere
+                    ports.append(p)
+    # Defauts par framework (le port explicite prime, mais sert de repli s'il manque)
+    if frameworks & {"flask", "app.run("} and 5000 not in ports:
+        ports.append(5000)
+    if frameworks & {"uvicorn", "http.server", "runserver", "waitress", "gunicorn"} and 8000 not in ports:
+        ports.append(8000)
+    if is_server and not ports:
+        ports.append(8000)
+    return is_server, ports
 
 def _wait_port_open(port, max_wait=8):
     """Sonde reellement le port en local — remplace la supposition 'le process n'a
@@ -326,6 +391,24 @@ def _wait_port_open(port, max_wait=8):
         except OSError:
             time.sleep(0.4)
     return False
+
+def _wait_any_port_open(ports, max_wait=12):
+    """Sonde plusieurs ports candidats jusqu'a ce que l'UN accepte une connexion TCP.
+    Retourne le port ouvert, ou None. L'ouverture TCP est le signal PRINCIPAL 'un serveur
+    ecoute' — plus fiable que HTTP (websockets/socketserver ne repondent pas sur / en HTTP)."""
+    import socket as _socket
+    if not ports:
+        return None
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        for p in ports:
+            try:
+                with _socket.create_connection(("127.0.0.1", p), timeout=0.4):
+                    return p
+            except OSError:
+                continue
+        time.sleep(0.4)
+    return None
 
 def _http_probe(port):
     """Requete HTTP reelle sur la racine du serveur — un statut (meme 404) prouve
@@ -341,7 +424,7 @@ def execute_project(project_dir, timeout=15):
     if not ep:
         return None, "Aucun fichier principal trouvé (main.py, app.py…)", None
     fpath = os.path.join(project_dir, ep)
-    is_server, guessed_port = _detect_server_port(project_dir)
+    is_server, server_ports = _detect_server_port(project_dir)
     proc = None
     try:
         proc = subprocess.Popen([PYTHON, fpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -355,19 +438,21 @@ def execute_project(project_dir, timeout=15):
             # qu'il repond reellement au lieu de supposer un succes (cf. HANDOFF.md —
             # plusieurs projets "reussis" avaient en realite un serveur jamais demarre).
             if is_server:
-                port_open = _wait_port_open(guessed_port, max_wait=min(8, timeout))
-                if port_open:
-                    ok_http, detail = _http_probe(guessed_port)
+                # Ouverture TCP sur N'IMPORTE lequel des ports candidats = serveur demarre.
+                # HTTP n'est qu'un detail informatif : un faux echec HTTP ne doit PAS declencher
+                # 3 cycles d'auto-correction sur un serveur (websocket/socket) qui marche.
+                opened = _wait_any_port_open(server_ports, max_wait=min(timeout, 12))
+                if opened is not None:
+                    ok_http, detail = _http_probe(opened)
                     _kill_process_tree(proc.pid)
                     try: proc.communicate(timeout=3)
                     except Exception: pass
-                    if ok_http:
-                        return True, f"(serveur actif — répond en HTTP {detail} sur le port {guessed_port})", ep
-                    return False, f"(port {guessed_port} ouvert mais aucune réponse HTTP valide: {detail})", ep
+                    http_note = f" — répond en HTTP {detail}" if ok_http else ""
+                    return True, f"(serveur actif — écoute sur le port {opened}{http_note})", ep
                 _kill_process_tree(proc.pid)
                 try: proc.communicate(timeout=3)
                 except Exception: pass
-                return False, f"(le serveur n'a jamais répondu sur le port {guessed_port} après {timeout}s — démarrage probablement en échec silencieux)", ep
+                return False, f"(le serveur n'a ouvert aucun port {server_ports} après {min(timeout,12)}s — démarrage probablement en échec silencieux)", ep
             # Pas un serveur détecté (calcul long, script CLI...) : on garde l'ancien
             # comportement, un timeout de process encore vivant reste ambigu mais
             # n'est pas un échec certain.
@@ -1116,6 +1201,11 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             if fixed:
                 await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
 
+        # Deduire requirements.txt des imports (le modele l'oublie souvent) AVANT l'install
+        added_deps = await asyncio.get_event_loop().run_in_executor(None, derive_requirements, project_dir)
+        if added_deps:
+            await websocket.send_json({"type":"file_created",
+                "name":f"requirements.txt (+{len(added_deps)} dépendance(s) déduite(s): {', '.join(added_deps[:6])})","size":""})
         # Installer les dépendances
         ok_dep, _ = await asyncio.get_event_loop().run_in_executor(None, install_deps, project_dir)
 
@@ -1166,21 +1256,28 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         "Conserve toute la logique/fonctionnalites qui marchent deja."
                     ) if escalate else ""
 
-                    # Brain analyse
-                    err_ctx = (f"ERREUR PRECISE: {clean_err}\n\nTRACE COMPLETE:\n{run_out}\n\n"
-                               f"CODE:\n{format_context(cur_files)}\n\n"
-                               f"Identifie la cause racine EXACTE et dis exactement quoi corriger.{escalate_note}")
-                    analysis = await asyncio.get_event_loop().run_in_executor(
-                        None, call_brain, err_ctx, BRAIN_FIX_SYSTEM, 400
-                    )
-                    if cancel_event.is_set():
-                        break
-                    await websocket.send_json({"type":"agent_start","agent":"brain"})
-                    await websocket.send_json({"type":"brain_think","text":analysis})
+                    # Brain analyse UNIQUEMENT quand on est bloque (meme erreur qui persiste).
+                    # Tant que l'erreur CHANGE (le modele progresse), on saute cette passe :
+                    # brain et coder sont le MEME modele 30b -> l'analyse re-evalue tout le
+                    # contexte (trace + code) que le coder re-evalue juste apres -> prompt-eval
+                    # double pour rien sur ce CPU. On ne paie l'analyse que si on tourne en rond.
+                    analysis = ""
+                    if escalate:
+                        err_ctx = (f"ERREUR PRECISE: {clean_err}\n\nTRACE COMPLETE:\n{run_out}\n\n"
+                                   f"CODE:\n{format_context(cur_files)}\n\n"
+                                   f"Identifie la cause racine EXACTE et dis exactement quoi corriger.{escalate_note}")
+                        analysis = await asyncio.get_event_loop().run_in_executor(
+                            None, call_brain, err_ctx, BRAIN_FIX_SYSTEM, 400
+                        )
+                        if cancel_event.is_set():
+                            break
+                        await websocket.send_json({"type":"agent_start","agent":"brain"})
+                        await websocket.send_json({"type":"brain_think","text":analysis})
 
-                    # Agent corrige
+                    # Agent corrige (n'injecte la section ANALYSE que si le brain a tourne)
+                    analyse_note = f"ANALYSE:\n{analysis}\n\n" if analysis else ""
                     fix_p = (f"ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
-                             f"ANALYSE:\n{analysis}\n\nTRACE COMPLETE:\n{run_out}\n\n"
+                             f"{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
                              f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
                              f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
                     fix_resp = await stream_agent(websocket, agent_name, fix_p, CODER_FIX_SYSTEM,
