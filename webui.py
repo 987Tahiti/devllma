@@ -126,12 +126,18 @@ MÉMOIRE WORKSPACE: {ctx}
 RÉALISÉ CETTE SESSION:
 {todo_str}
 
+CIBLE MATÉRIELLE: poste LOCAL sans carte graphique (CPU uniquement). Choisis des dépendances
+LÉGÈRES et qui tournent en pratique sur ce poste. ÉVITE torch/tensorflow/CUDA/diffusers et les
+gros modèles ML sauf si l'utilisateur le demande EXPLICITEMENT — préfère une API/bibliothèque
+légère, et si une tâche exige vraiment du lourd (génération d'image...), dis-le clairement dans
+POINTS CLÉS au lieu de produire un projet qui ne tournera pas ici.
+
 Pour chaque demande produis un plan structuré:
 1. PROJET: nom exact du projet
-2. STACK: technologies choisies
+2. STACK: technologies choisies (légères, compatibles CPU)
 3. FICHIERS: liste exacte à créer (avec chemins relatifs)
 4. ARCHITECTURE: structure en 3-5 lignes
-5. POINTS CLÉS: ce qu'il ne faut pas oublier
+5. POINTS CLÉS: ce qu'il ne faut pas oublier (dont: limites sur ce poste CPU)
 6. TODOS: 3-5 tâches numérotées que le codeur va accomplir
 
 Sois précis, concis. Si un projet similaire existe déjà dans le workspace, mentionne-le."""
