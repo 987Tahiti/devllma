@@ -270,9 +270,12 @@ SECURITY_RULES = [
         "HAUTE", "Secret/mot de passe en dur dans le code"),
     (r'(?i)execute\s*\(\s*[f]?[\'"].*?(?:%s|\{|\+)',
         "HAUTE", "Injection SQL possible (requête construite par concaténation)"),
-    (r'\beval\s*\(',
+    # (?<![\'"\w.]) : ignore 'eval(' a l'interieur d'une chaine (ex: liste anti-XSS
+    # ['eval(', ...]) ou d'un attribut (obj.eval(), re.eval...) -> evite le faux positif
+    # constate en usage reel sur du code prudent qui LISTE eval comme motif a bloquer.
+    (r'(?<![\'"\w.])eval\s*\(',
         "HAUTE", "Usage de eval() — exécution de code arbitraire"),
-    (r'\bexec\s*\(',
+    (r'(?<![\'"\w.])exec\s*\(',
         "HAUTE", "Usage de exec() — exécution de code arbitraire"),
     (r'subprocess\.\w+\([^)]*shell\s*=\s*True',
         "MOYENNE", "subprocess avec shell=True — injection de commande"),
