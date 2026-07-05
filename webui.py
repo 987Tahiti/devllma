@@ -529,6 +529,17 @@ def is_file_or_doc_action(prompt):
     low = strip_accents(prompt.lower())
     return bool(_FILE_OR_DOC_RE.search(low)) and not bool(_STRONG_DEV_RE.search(low))
 
+# Generation de MEDIA lourd (image/video) : tache que ce poste CPU ne peut pas faire ->
+# on l'envoie a l'agent, qui la delegue AUTOMATIQUEMENT au GPU Colab (outil colab_run).
+# Ce n'est pas un "projet" a scaffolder ; router vers l'agent est aussi sans risque car
+# l'agent gere images (lecture ET generation) mieux que le pipeline.
+_HEAVY_MEDIA_RE = re.compile(
+    r'\b(gener\w*|cree\w*|creer|dessine\w*|fais|produis|fabrique\w*)\b[^.?!\n]{0,40}'
+    r'\b(image|images|photo|photos|illustration|dessin|logo|visuel|banniere|avatar|'
+    r'video|videos|clip|animation|rendu)\b')
+def is_heavy_media_request(prompt):
+    return bool(_HEAVY_MEDIA_RE.search(strip_accents(prompt.lower())))
+
 def match_existing_project(prompt):
     """Retrouve le projet EXISTANT visé par la demande (nom entre « », ou nom present dans le texte).
     Retourne le nom exact du dossier workspace, ou None."""
@@ -1069,8 +1080,11 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # mentionne python/api/sql : sans ce garde-fou, "Explique-moi les listes en Python"
     # generait un projet complet au lieu de repondre (constate au banc de tests).
     is_question = is_research_question(prompt) and not match_existing_project(prompt) and not is_edit(prompt)
+    # Generer une image/video = tache lourde -> agent (delegue au GPU Colab), pas le pipeline projet
+    heavy_media = is_heavy_media_request(prompt) and not match_existing_project(prompt)
     dev_signal = (has_dev_keywords(prompt) or match_existing_project(prompt) or is_edit(prompt)) \
-                 and not is_file_or_doc_action(prompt) and not is_doc_message and not is_question
+                 and not is_file_or_doc_action(prompt) and not is_doc_message and not is_question \
+                 and not heavy_media
     if not dev_signal:
         await handle_agent(websocket, sid_box, prompt, cancel_event)
         return

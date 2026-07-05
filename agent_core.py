@@ -21,7 +21,7 @@ from datetime import datetime
 from agents import OLLAMA
 from skills import safety_check
 from tools import web_search as _web_search
-from db import mem_search, mem_index
+from db import mem_search, mem_index, mem_get, mem_set
 from documents import is_office_doc, read_document, write_document
 
 _http = requests.Session()  # connexion reutilisee (keep-alive) pour les appels Ollama
@@ -240,6 +240,17 @@ TOOLS = [
             "target":{"type":"string"}
         },"required":["target"]}
     }},
+    {"type":"function","function":{
+        "name":"colab_run",
+        "description":"Delegue une tache LOURDE a un GPU Google Colab distant (ce poste est CPU-only et ne peut pas la faire) : generation d'IMAGE, de VIDEO, gros modele ML, rendu. A utiliser DES qu'on demande de creer/generer une image ou une video. Renvoie le chemin du fichier local produit. L'url du tunnel Colab se donne UNE fois (memorisee ensuite).",
+        "parameters":{"type":"object","properties":{
+            "task":{"type":"string","enum":["image","video"],"description":"type de tache lourde"},
+            "prompt":{"type":"string","description":"description de ce qu'il faut generer"},
+            "url":{"type":"string","description":"optionnel : URL du tunnel Colab (a donner une fois, memorisee)"},
+            "token":{"type":"string","description":"optionnel : jeton du notebook (memorise)"},
+            "params":{"type":"object","description":"optionnel : reglages (steps, seconds, ...)"}
+        },"required":["task","prompt"]}
+    }},
 ]
 
 def _tool_read_file(args):
@@ -331,7 +342,7 @@ def _audit_log(tool, detail, outcome):
 # le dispatch ne voit pas. Les DEUX sont conserves.
 AUDIT_JSONL_PATH = r"C:\Devllma\logs\agent_audit.jsonl"
 _audit_lock = threading.Lock()  # run_agent_sync tourne dans des threads executor
-_AUDITED_TOOLS = {"run_powershell", "execute_python", "write_file", "edit_file", "run_sql", "http_request", "open_path"}
+_AUDITED_TOOLS = {"run_powershell", "execute_python", "write_file", "edit_file", "run_sql", "http_request", "open_path", "colab_run"}
 # Cles REELLES porteuses de contenu volumineux, verifiees dans les _tool_* :
 # write_file->content, execute_python->code, edit_file->old_string/new_string,
 # run_powershell->command, run_sql->query (PAS 'sql'), http_request->json_body (PAS 'body')
@@ -889,6 +900,67 @@ def _tool_open_path(args):
         return {"error": f"ouverture impossible : {e}"}
     return {"ouvert": path, "type": "dossier" if os.path.isdir(path) else "fichier"}
 
+# ── Delegation des taches LOURDES a un GPU Google Colab ───────────────────────
+# Ce poste est CPU-only : generation d'image/video, gros modeles ML, rendu... ne
+# tournent pas (ou en des heures). On envoie ces taches a un notebook Colab (GPU T4
+# gratuit) expose en HTTP par un tunnel. Colab est ephemere -> l'URL du tunnel se
+# configure UNE fois (memorisee en base) puis l'agent appelle cet outil tout seul.
+COLAB_EXT_FALLBACK = {"image": "png", "video": "mp4"}
+
+def _tool_colab_run(args):
+    import base64
+    task = (args.get("task") or "image").strip().lower()
+    prompt = (args.get("prompt") or "").strip()
+    if not prompt:
+        return {"error": "prompt vide"}
+    # Config persistante : une url/token passes sont memorises pour les appels suivants
+    if (args.get("url") or "").strip():
+        mem_set("colab_url", args["url"].strip().rstrip("/"))
+    if (args.get("token") or "").strip():
+        mem_set("colab_token", args["token"].strip())
+    base = mem_get("colab_url")
+    if not base:
+        return {"error": "GPU Colab pas encore configure : demande a l'utilisateur de demarrer le "
+                         "notebook Colab-Worker.ipynb, puis rappelle cet outil avec "
+                         "url='https://....trycloudflare.com' (affichee par le notebook)."}
+    headers = {"Content-Type": "application/json"}
+    tok = mem_get("colab_token")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        # timeout large : une video ou un gros batch peut prendre plusieurs minutes sur T4
+        r = _http.post(base + "/run", headers=headers,
+                       json={"task": task, "prompt": prompt, "params": args.get("params") or {}},
+                       timeout=600)
+    except requests.RequestException as e:
+        return {"error": f"GPU Colab injoignable ({e}). Le notebook est-il demarre ? "
+                         "Demande a l'utilisateur de le relancer et de te donner la nouvelle url."}
+    if r.status_code != 200:
+        return {"error": f"Colab a repondu {r.status_code} : {r.text[:200]}"}
+    try:
+        body = r.json()
+    except Exception:
+        return {"error": "reponse Colab invalide (JSON attendu)"}
+    if body.get("error"):
+        return {"error": f"Colab : {body['error']}"}
+    b64 = body.get("file_base64")
+    if not b64:
+        return {"error": "Colab n'a renvoye aucun fichier"}
+    ext = (body.get("ext") or COLAB_EXT_FALLBACK.get(task, "bin")).lstrip(".")
+    out_dir = os.path.join(WORKSPACE_DIR, "colab_out")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = re.sub(r'[^\w]+', '_', prompt.lower())[:40].strip('_') or task
+    path = os.path.join(out_dir, f"{stem}.{ext}")
+    i = 2
+    while os.path.exists(path):
+        path = os.path.join(out_dir, f"{stem}_{i}.{ext}"); i += 1
+    try:
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64))
+    except Exception as e:
+        return {"error": f"ecriture du fichier impossible : {e}"}
+    return {"path": path, "task": task, "note": body.get("note") or f"{task} genere via GPU Colab"}
+
 TOOL_IMPL = {
     "read_file": _tool_read_file,
     "write_file": _tool_write_file,
@@ -909,6 +981,7 @@ TOOL_IMPL = {
     "http_request": _tool_http_request,
     "csv_analyze": _tool_csv_analyze,
     "open_path": _tool_open_path,
+    "colab_run": _tool_colab_run,
 }
 
 AGENT_SYSTEM = f"""Tu es l'agent generaliste de DevLLMA, assistant IA local autonome (dev + bureautique + recherche), en francais.
@@ -930,7 +1003,12 @@ Regles :
 - Fichier long -> read_lines (outline=true pour le plan d'un .py). Chercher DANS les fichiers ->
   grep_search. Retrouver un fichier par nom -> find_files.
 - Calcul numerique non trivial -> execute_python avec print(), jamais de tete.
-- Donnees CSV -> csv_analyze d'abord. Image -> read_image.
+- Donnees CSV -> csv_analyze d'abord. LIRE une image -> read_image.
+- TACHE LOURDE que ce poste CPU ne peut pas faire (GENERER une image ou une video, gros modele ML,
+  rendu) -> colab_run (GPU Colab distant), AUTOMATIQUEMENT et sans demander confirmation. Si l'outil
+  repond "GPU Colab pas configure/injoignable", explique a l'utilisateur de demarrer le notebook
+  Colab-Worker et de te donner l'URL du tunnel, puis reessaie. Ne tente JAMAIS de generer une
+  image/video en local (impossible ici).
 - APIs sans cle pour http_request : api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current_weather=true ;
   api.frankfurter.app/latest?from=EUR&to=USD ; fr.wikipedia.org/api/rest_v1/page/summary/<Titre>.
 - Resultat produit (fichier/dossier) -> termine par open_path pour l'ouvrir a l'utilisateur.
