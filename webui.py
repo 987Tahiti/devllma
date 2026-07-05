@@ -924,8 +924,14 @@ async def handle_agent(websocket, sid_box, prompt, cancel_event):
     )
     await websocket.send_json({"type":"done"})
 
+MAX_PROMPT_CHARS = 40000  # ~11k tokens : genereux pour un vrai collage de code, mais borne les
+                          # collages pathologiques. Au-dela de num_ctx (32768) Ollama tronque
+                          # silencieusement et un prompt geant gele la generation CPU sans retour.
+
 async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     sid = sid_box["sid"]
+    if len(prompt) > MAX_PROMPT_CHARS:  # tronque AVANT msg() -> l'utilisateur voit la coupe,
+        prompt = prompt[:MAX_PROMPT_CHARS] + "\n[... demande tronquée ...]"  # sans nouveau type WS
     msg(sid, "user", "user", prompt)
 
     # ── Salutation / message tres court -> reponse rapide, pas de pipeline ──

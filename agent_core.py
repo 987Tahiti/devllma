@@ -64,8 +64,18 @@ _DENY_PREFIXES = [
 def _guard_path(path):
     ap = os.path.abspath(os.path.expandvars(path))
     low = ap.lower()
+    # Neutralise les contournements Windows : prefixe de chemin etendu (\\?\) et namespace
+    # device (\\.\) preservent le chemin sans "c:\" (donc echappaient au startswith) ; les
+    # chemins UNC (\\serveur\C$, \\127.0.0.1\C$) pointent vers le MEME disque reel. On retire
+    # \\?\ / \\.\, puis tout UNC restant est refuse d'office (hors perimetre de l'assistant).
+    if low.startswith("\\\\?\\") or low.startswith("\\\\.\\"):
+        ap = ap[4:]; low = low[4:]
+    if low.startswith("\\\\"):
+        raise PermissionError(f"accès refusé — chemin réseau/UNC non autorisé : {ap}")
     for d in _DENY_PREFIXES:
-        if low.startswith(d):
+        # `== d or startswith(d + "\\")` (au lieu du startswith nu) evite de bloquer a tort
+        # un "C:\Windows_autre" tout en couvrant "C:\Windows" et tout ce qu'il contient.
+        if low == d or low.startswith(d + "\\"):
             raise PermissionError(f"accès refusé — dossier système protégé : {ap}")
     return ap
 
@@ -691,6 +701,15 @@ def _tool_read_image(args):
     ext = os.path.splitext(path)[1].lower()
     if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"):
         return {"error": "ce n'est pas une image — utilise read_file pour les documents texte/Office/PDF"}
+    # Plafond de taille AVANT tout chargement : la vision encode l'image en base64 (+33 %) dans
+    # un corps JSON, et l'OCR recharge le bitmap entier -> une image enorme saturerait la RAM
+    # (poste limite). Couvre les deux chemins.
+    try:
+        taille = os.path.getsize(path)
+    except OSError as e:
+        return {"error": f"image illisible : {e}"}
+    if taille > 20_000_000:
+        return {"error": f"image trop volumineuse ({round(taille/1_048_576,1)} Mo, max 20 Mo) — réduis/convertis-la avant analyse"}
     # Avec une question -> analyse VISUELLE (comprend le contenu), sinon OCR (texte brut, rapide).
     question = (args.get("question") or "").strip()
     if question:
@@ -837,8 +856,13 @@ def _tool_csv_analyze(args):
         out["echantillon"] = sample
     return out
 
-_BLOCKED_EXEC = {".exe", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
-                 ".msi", ".msp", ".scr", ".lnk", ".hta", ".jar", ".com", ".pif", ".reg"}
+# Extensions "actives" (executees par le shell Windows via os.startfile) refusees par open_path.
+# Ajout des manquantes reperees en revue : .py/.pyw/.pyc (Python associe = execution), .scf/.url
+# (raccourcis a effet de bord), .cpl/.msc/.gadget/.application/.msh* (panneaux/scripts actifs).
+_BLOCKED_EXEC = {".exe", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
+                 ".wsh", ".ws", ".wsc", ".msi", ".msp", ".scr", ".lnk", ".hta", ".jar", ".com",
+                 ".pif", ".reg", ".py", ".pyw", ".pyc", ".pyz", ".pyzw", ".scf", ".url", ".cpl",
+                 ".msc", ".msh", ".msh1", ".msh2", ".gadget", ".application"}
 
 def _tool_open_path(args):
     target = (args.get("target") or "").strip().strip('"')

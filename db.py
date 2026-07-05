@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS embeddings(
     kind TEXT, ref_id INTEGER, ref_name TEXT,
     chunk TEXT, vector TEXT, ts TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_embeddings_kind ON embeddings(kind);
+-- (session_id, ts) couvre exactement history() : range-scan de la session deja triee,
+-- parcouru en sens inverse pour ORDER BY ts DESC LIMIT -> plus de full scan a chaque tour.
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, ts);
 INSERT OR IGNORE INTO agents_cfg(name,model,description) VALUES
     ('brain','brain-llma','Orchestrateur central - analyse et distribue les taches'),
     ('architect','architect-llma','Architecture et conception systeme'),
@@ -241,6 +244,10 @@ def reindex_embeddings():
         with cx() as c:
             c.execute("UPDATE embeddings SET vector=? WHERE id=?", (json.dumps(vec), eid))
         ok += 1
+    _mem_invalidate()  # coherence avec mem_index/mem_delete/mem_purge : sans ca un mem_search
+                       # in-process (appel manuel, futur bouton reindex UI) servirait l'ancienne
+                       # matrice cache aux dimensions/vecteurs perimes. (Le cas prod = process
+                       # separe reste soumis a la staleness inter-process deja documentee.)
     return ok, len(rows), fail
 
 def mem_index(kind, ref_name, text, ref_id=None):
@@ -254,7 +261,9 @@ def mem_index(kind, ref_name, text, ref_id=None):
             (kind, ref_name, text[:2000])).fetchone()
         if dup:
             return dup[0]
-    vec = embed(text)
+    vec = embed(text[:2000])  # embed EXACTEMENT le texte stocke (chunk = text[:2000]) : sinon
+                              # le vecteur represente jusqu'a 6000 car alors que reindex_embeddings
+                              # ne dispose que des 2000 stockes -> vecteurs divergents (non idempotent).
     if not vec:
         return None
     with cx() as c:
