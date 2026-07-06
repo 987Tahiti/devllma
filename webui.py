@@ -1063,7 +1063,8 @@ def _colab_llm(system, prompt, timeout=600):
     base = mem_get("colab_url")
     if not base:
         return None
-    headers = {"Content-Type": "application/json"}
+    # ngrok-skip-browser-warning : evite la page d'avertissement HTML de ngrok gratuit.
+    headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
     tok = mem_get("colab_token")
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
@@ -1547,9 +1548,39 @@ def _startup_warmup():
     from agent_core import warm_agent_cache
     warm_agent_cache()
 
+def _self_watchdog():
+    """Auto-surveillance INTERNE : constate (05/07/2026) qu'un process peut rester
+    vivant des heures sans jamais repondre (bloque avant l'ouverture du port),
+    sans que Task Scheduler ne le detecte (il n'a pas "plante"). Une tache Windows
+    EXTERNE separee chargee de detecter/relancer ca a ete supprimee par l'antivirus
+    quelques secondes apres sa creation (signature de persistance : SYSTEM,
+    recurrente, pouvoir de tuer des process). Solution : le process se surveille
+    LUI-MEME et se termine (os._exit) s'il ne repond plus a une requete HTTP locale
+    pendant plusieurs minutes — le redemarrage automatique deja configure sur la
+    tache planifiee (RestartCount=3, RestartInterval=1 min) reprend alors la main.
+    Ne tue jamais rien d'autre que soi-meme : ne devrait pas etre vu comme un outil
+    de persistance/attaque."""
+    time.sleep(60)  # laisse le temps au demarrage normal (bind du port quasi instantane,
+                     # mais on evite tout faux positif pendant les tout premiers instants)
+    fails = 0
+    while True:
+        try:
+            r = requests.get("http://127.0.0.1:8080/", timeout=10)
+            fails = 0 if r.status_code == 200 else fails + 1
+        except Exception:
+            fails += 1
+        if fails:
+            print(f"[AUTO-SURVEILLANCE] serveur local injoignable ({fails}/3)", flush=True)
+        if fails >= 3:
+            print("[AUTO-SURVEILLANCE] injoignable depuis ~4-5 min -> arret force "
+                  "pour declencher le redemarrage automatique de la tache planifiee", flush=True)
+            os._exit(1)
+        time.sleep(90)
+
 if __name__ == "__main__":
     import threading
     threading.Thread(target=_startup_warmup, daemon=True).start()
+    threading.Thread(target=_self_watchdog, daemon=True).start()
     # host="0.0.0.0" est INTENTIONNEL, pas un oubli : c'est ce qui permet l'acces
     # LAN (192.168.1.30) et Tailscale (100.112.22.79, PWA mobile) mis en place
     # deliberement. Le repasser en 127.0.0.1 casserait l'acces telephone/tablette.

@@ -931,7 +931,9 @@ def _colab_backend(task, prompt, params):
     base = mem_get("colab_url")
     if not base:
         return None
-    headers = {"Content-Type": "application/json"}
+    # ngrok-skip-browser-warning : ngrok gratuit renvoie sinon une page d'avertissement HTML
+    # au lieu du JSON du worker -> parsing casse. Cet en-tete la contourne.
+    headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
     tok = mem_get("colab_token")
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
