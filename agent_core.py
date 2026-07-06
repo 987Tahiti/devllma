@@ -241,13 +241,14 @@ TOOLS = [
         },"required":["target"]}
     }},
     {"type":"function","function":{
-        "name":"colab_run",
-        "description":"Delegue une tache LOURDE a un GPU Google Colab distant (ce poste est CPU-only et ne peut pas la faire) : generation d'IMAGE, de VIDEO, gros modele ML, rendu. A utiliser DES qu'on demande de creer/generer une image ou une video. Renvoie le chemin du fichier local produit. L'url du tunnel Colab se donne UNE fois (memorisee ensuite).",
+        "name":"generate_media",
+        "description":"Genere une IMAGE ou une VIDEO (ce poste CPU ne peut pas le faire en local). A utiliser DES qu'on demande de creer/generer une image ou une video. Utilise en priorite une API hebergee (Hugging Face, gratuit, toujours dispo) puis un GPU Colab en repli. Renvoie le chemin du fichier local. Les cles se donnent UNE fois (memorisees).",
         "parameters":{"type":"object","properties":{
-            "task":{"type":"string","enum":["image","video"],"description":"type de tache lourde"},
+            "task":{"type":"string","enum":["image","video"],"description":"image ou video"},
             "prompt":{"type":"string","description":"description de ce qu'il faut generer"},
-            "url":{"type":"string","description":"optionnel : URL du tunnel Colab (a donner une fois, memorisee)"},
-            "token":{"type":"string","description":"optionnel : jeton du notebook (memorise)"},
+            "hf_token":{"type":"string","description":"optionnel : cle Hugging Face (hf_...), a donner une fois"},
+            "colab_url":{"type":"string","description":"optionnel : URL d'un worker GPU Colab (repli, surtout video)"},
+            "colab_token":{"type":"string","description":"optionnel : jeton du worker Colab"},
             "params":{"type":"object","description":"optionnel : reglages (steps, seconds, ...)"}
         },"required":["task","prompt"]}
     }},
@@ -342,7 +343,7 @@ def _audit_log(tool, detail, outcome):
 # le dispatch ne voit pas. Les DEUX sont conserves.
 AUDIT_JSONL_PATH = r"C:\Devllma\logs\agent_audit.jsonl"
 _audit_lock = threading.Lock()  # run_agent_sync tourne dans des threads executor
-_AUDITED_TOOLS = {"run_powershell", "execute_python", "write_file", "edit_file", "run_sql", "http_request", "open_path", "colab_run"}
+_AUDITED_TOOLS = {"run_powershell", "execute_python", "write_file", "edit_file", "run_sql", "http_request", "open_path", "generate_media", "colab_run"}
 # Cles REELLES porteuses de contenu volumineux, verifiees dans les _tool_* :
 # write_file->content, execute_python->code, edit_file->old_string/new_string,
 # run_powershell->command, run_sql->query (PAS 'sql'), http_request->json_body (PAS 'body')
@@ -900,54 +901,87 @@ def _tool_open_path(args):
         return {"error": f"ouverture impossible : {e}"}
     return {"ouvert": path, "type": "dossier" if os.path.isdir(path) else "fichier"}
 
-# ── Delegation des taches LOURDES a un GPU Google Colab ───────────────────────
-# Ce poste est CPU-only : generation d'image/video, gros modeles ML, rendu... ne
-# tournent pas (ou en des heures). On envoie ces taches a un notebook Colab (GPU T4
-# gratuit) expose en HTTP par un tunnel. Colab est ephemere -> l'URL du tunnel se
-# configure UNE fois (memorisee en base) puis l'agent appelle cet outil tout seul.
-COLAB_EXT_FALLBACK = {"image": "png", "video": "mp4"}
+# ── Generation de MEDIA lourd (image/video) : ce poste CPU ne peut pas le faire ──
+# Deux backends, essayes dans l'ordre : (1) API HEBERGEE (Hugging Face, gratuit, TOUJOURS
+# dispo, rien a demarrer), (2) repli GPU Colab (si un notebook worker tourne). Les cles/URL
+# se configurent UNE fois (memorisees en base) puis l'agent appelle l'outil tout seul.
+_MEDIA_EXT = {"image": "png", "video": "mp4"}
 
-def _tool_colab_run(args):
+def _hf_image_backend(prompt, params):
+    """Image via Hugging Face Inference API (gratuit avec limites). -> (bytes, ext) ou None."""
+    key = mem_get("hf_token")
+    if not key:
+        return None
+    model = mem_get("hf_image_model") or "stabilityai/stable-diffusion-xl-base-1.0"
+    try:
+        r = _http.post(f"https://api-inference.huggingface.co/models/{model}",
+                       headers={"Authorization": f"Bearer {key}", "Accept": "image/png"},
+                       json={"inputs": prompt}, timeout=120)
+    except requests.RequestException:
+        return None
+    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+        return r.content, "png"
+    return None  # 503 (modele en chargement), 401 (cle), quota... -> repli/erreur
+
+def _colab_backend(task, prompt, params):
+    """Image/video via le worker GPU Colab (si configure). -> (bytes, ext) ou None."""
     import base64
-    task = (args.get("task") or "image").strip().lower()
-    prompt = (args.get("prompt") or "").strip()
-    if not prompt:
-        return {"error": "prompt vide"}
-    # Config persistante : une url/token passes sont memorises pour les appels suivants
-    if (args.get("url") or "").strip():
-        mem_set("colab_url", args["url"].strip().rstrip("/"))
-    if (args.get("token") or "").strip():
-        mem_set("colab_token", args["token"].strip())
     base = mem_get("colab_url")
     if not base:
-        return {"error": "GPU Colab pas encore configure : demande a l'utilisateur de demarrer le "
-                         "notebook Colab-Worker.ipynb, puis rappelle cet outil avec "
-                         "url='https://....trycloudflare.com' (affichee par le notebook)."}
+        return None
     headers = {"Content-Type": "application/json"}
     tok = mem_get("colab_token")
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     try:
-        # timeout large : une video ou un gros batch peut prendre plusieurs minutes sur T4
         r = _http.post(base + "/run", headers=headers,
-                       json={"task": task, "prompt": prompt, "params": args.get("params") or {}},
-                       timeout=600)
-    except requests.RequestException as e:
-        return {"error": f"GPU Colab injoignable ({e}). Le notebook est-il demarre ? "
-                         "Demande a l'utilisateur de le relancer et de te donner la nouvelle url."}
+                       json={"task": task, "prompt": prompt, "params": params or {}}, timeout=600)
+    except requests.RequestException:
+        return None
     if r.status_code != 200:
-        return {"error": f"Colab a repondu {r.status_code} : {r.text[:200]}"}
+        return None
     try:
         body = r.json()
     except Exception:
-        return {"error": "reponse Colab invalide (JSON attendu)"}
-    if body.get("error"):
-        return {"error": f"Colab : {body['error']}"}
+        return None
     b64 = body.get("file_base64")
     if not b64:
-        return {"error": "Colab n'a renvoye aucun fichier"}
-    ext = (body.get("ext") or COLAB_EXT_FALLBACK.get(task, "bin")).lstrip(".")
-    out_dir = os.path.join(WORKSPACE_DIR, "colab_out")
+        return None
+    ext = (body.get("ext") or _MEDIA_EXT.get(task, "bin")).lstrip(".")
+    try:
+        return base64.b64decode(b64), ext
+    except Exception:
+        return None
+
+def _tool_generate_media(args):
+    task = (args.get("task") or "image").strip().lower()
+    prompt = (args.get("prompt") or "").strip()
+    if not prompt:
+        return {"error": "prompt vide"}
+    # Config persistante (cles/url donnees une fois, memorisees ensuite)
+    for k in ("hf_token", "hf_image_model", "colab_url", "colab_token"):
+        v = (args.get(k) or "").strip()
+        if v:
+            mem_set(k, v.rstrip("/") if k == "colab_url" else v)
+    params = args.get("params") or {}
+    data = ext = backend = None
+    # 1) API hebergee (toujours dispo) — image via HF gratuit
+    if task == "image":
+        res = _hf_image_backend(prompt, params)
+        if res:
+            data, ext, backend = res[0], res[1], "Hugging Face"
+    # 2) repli GPU Colab (image + video)
+    if data is None:
+        res = _colab_backend(task, prompt, params)
+        if res:
+            data, ext, backend = res[0], res[1], "GPU Colab"
+    if data is None:
+        if not mem_get("hf_token") and not mem_get("colab_url"):
+            return {"error": "aucun backend media configure : demande a l'utilisateur une cle Hugging Face "
+                             "(hf_token='hf_...') pour la voie hebergee gratuite, ou l'URL d'un worker Colab."}
+        return {"error": f"generation {task} impossible (cle invalide, quota atteint, modele en chargement, "
+                         "ou worker Colab eteint). Pour la video, HF gratuit ne suffit pas -> worker Colab requis."}
+    out_dir = os.path.join(WORKSPACE_DIR, "media_out")
     os.makedirs(out_dir, exist_ok=True)
     stem = re.sub(r'[^\w]+', '_', prompt.lower())[:40].strip('_') or task
     path = os.path.join(out_dir, f"{stem}.{ext}")
@@ -956,10 +990,13 @@ def _tool_colab_run(args):
         path = os.path.join(out_dir, f"{stem}_{i}.{ext}"); i += 1
     try:
         with open(path, "wb") as f:
-            f.write(base64.b64decode(b64))
+            f.write(data)
     except Exception as e:
         return {"error": f"ecriture du fichier impossible : {e}"}
-    return {"path": path, "task": task, "note": body.get("note") or f"{task} genere via GPU Colab"}
+    return {"path": path, "task": task, "backend": backend, "note": f"{task} genere via {backend}"}
+
+def _tool_colab_run(args):  # compat : ancien nom -> logique unifiee
+    return _tool_generate_media(args)
 
 TOOL_IMPL = {
     "read_file": _tool_read_file,
@@ -981,7 +1018,8 @@ TOOL_IMPL = {
     "http_request": _tool_http_request,
     "csv_analyze": _tool_csv_analyze,
     "open_path": _tool_open_path,
-    "colab_run": _tool_colab_run,
+    "generate_media": _tool_generate_media,
+    "colab_run": _tool_colab_run,  # compat (ancien nom)
 }
 
 AGENT_SYSTEM = f"""Tu es l'agent generaliste de DevLLMA, assistant IA local autonome (dev + bureautique + recherche), en francais.
@@ -1004,11 +1042,10 @@ Regles :
   grep_search. Retrouver un fichier par nom -> find_files.
 - Calcul numerique non trivial -> execute_python avec print(), jamais de tete.
 - Donnees CSV -> csv_analyze d'abord. LIRE une image -> read_image.
-- TACHE LOURDE que ce poste CPU ne peut pas faire (GENERER une image ou une video, gros modele ML,
-  rendu) -> colab_run (GPU Colab distant), AUTOMATIQUEMENT et sans demander confirmation. Si l'outil
-  repond "GPU Colab pas configure/injoignable", explique a l'utilisateur de demarrer le notebook
-  Colab-Worker et de te donner l'URL du tunnel, puis reessaie. Ne tente JAMAIS de generer une
-  image/video en local (impossible ici).
+- GENERER une image ou une video (ce poste CPU ne peut pas) -> generate_media, AUTOMATIQUEMENT
+  et sans demander confirmation (backend heberge Hugging Face en priorite, GPU Colab en repli).
+  Si l'outil dit "aucun backend configure", explique a l'utilisateur qu'il faut une cle Hugging
+  Face (gratuite) ou un worker Colab, puis reessaie. Ne tente JAMAIS de generer en local.
 - APIs sans cle pour http_request : api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current_weather=true ;
   api.frankfurter.app/latest?from=EUR&to=USD ; fr.wikipedia.org/api/rest_v1/page/summary/<Titre>.
 - Resultat produit (fichier/dossier) -> termine par open_path pour l'ouvrir a l'utilisateur.
