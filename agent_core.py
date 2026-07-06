@@ -908,20 +908,22 @@ def _tool_open_path(args):
 _MEDIA_EXT = {"image": "png", "video": "mp4"}
 
 def _hf_image_backend(prompt, params):
-    """Image via Hugging Face Inference API (gratuit avec limites). -> (bytes, ext) ou None."""
+    """Image via Hugging Face Inference Providers (routeur actuel ; l'ancien
+    api-inference.huggingface.co est retire). Gratuit avec credits limites.
+    -> (bytes, ext) ou None. FLUX.1-schnell : rapide et dispo sur hf-inference."""
     key = mem_get("hf_token")
     if not key:
         return None
-    model = mem_get("hf_image_model") or "stabilityai/stable-diffusion-xl-base-1.0"
+    model = mem_get("hf_image_model") or "black-forest-labs/FLUX.1-schnell"
     try:
-        r = _http.post(f"https://api-inference.huggingface.co/models/{model}",
+        r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
                        headers={"Authorization": f"Bearer {key}", "Accept": "image/png"},
                        json={"inputs": prompt}, timeout=120)
     except requests.RequestException:
         return None
     if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
         return r.content, "png"
-    return None  # 503 (modele en chargement), 401 (cle), quota... -> repli/erreur
+    return None  # 402 (credits epuises), 401 (cle), 503 (chargement)... -> repli/erreur
 
 def _colab_backend(task, prompt, params):
     """Image/video via le worker GPU Colab (si configure). -> (bytes, ext) ou None."""
