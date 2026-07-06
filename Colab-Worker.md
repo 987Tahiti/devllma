@@ -110,6 +110,31 @@ print("Garde cet onglet ouvert. DevLLMA connait deja cette URL : demande juste u
 
 ---
 
+### Cellule 4 (OPTIONNELLE) — Déléguer du CODE au GPU (qwen2.5-coder:14b)
+> À ajouter seulement si tu veux que DevLLMA envoie les **gros dev / cas bloqués** au GPU.
+> Colle-la AVANT la cellule 3 (le serveur doit connaître l'endpoint `/llm` au démarrage),
+> ou relance la cellule 3 après. Le modèle (~9 Go) se télécharge à la 1re exécution.
+```python
+# Ollama + modele de code sur le GPU
+!curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1
+import subprocess, time, requests
+subprocess.Popen(["ollama","serve"])
+time.sleep(5)
+print("Téléchargement de qwen2.5-coder:14b (~9 Go, une fois)...")
+subprocess.run(["ollama","pull","qwen2.5-coder:14b"])
+
+from fastapi import Body
+@app.post("/llm")
+def llm(body: dict = Body(...), authorization: str = Header(default="")):
+    if authorization != f"Bearer {TOKEN}": raise HTTPException(401, "token invalide")
+    r = requests.post("http://localhost:11434/api/generate", json={
+        "model":"qwen2.5-coder:14b","system":body.get("system",""),
+        "prompt":body.get("prompt",""),"stream":False,
+        "options":{"temperature":0.2,"num_ctx":16384,"num_predict":4000}}, timeout=590)
+    return {"response": r.json().get("response","")}
+print("Endpoint /llm prêt (relance la cellule 3 si tu l'avais deja lancee).")
+```
+
 ## Utilisation quotidienne (après config)
 1. Ouvre le notebook, **Exécuter tout** (cellules 1→3). Attends « WORKER PRET ».
 2. Dans DevLLMA : *« génère une image d'un chat astronaute »* → c'est tout. ✅

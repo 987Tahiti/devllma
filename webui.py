@@ -1052,6 +1052,43 @@ MAX_PROMPT_CHARS = 40000  # ~11k tokens : genereux pour un vrai collage de code,
                           # collages pathologiques. Au-dela de num_ctx (32768) Ollama tronque
                           # silencieusement et un prompt geant gele la generation CPU sans retour.
 
+# ── Delegation du CODE au GPU Colab (qwen2.5-coder:14b) pour les cas lourds ──────
+# Le modele local (30b sur CPU) rame sur les gros projets / quand il tourne en rond.
+# On envoie alors la generation au worker Colab (endpoint /llm, GPU) — bien plus rapide,
+# et modele different = second avis quand le local bloque. Repli local si Colab eteint.
+_COLAB_ASK_RE = re.compile(r'\b(utilise|via|avec|sur|passe par)\s+colab\b')
+
+def _colab_llm(system, prompt, timeout=600):
+    """Generation de code par le LLM GPU du worker Colab (/llm). Texte, ou None si indispo."""
+    base = mem_get("colab_url")
+    if not base:
+        return None
+    headers = {"Content-Type": "application/json"}
+    tok = mem_get("colab_token")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        r = _http.post(base + "/llm", headers=headers,
+                       json={"system": system or "", "prompt": prompt}, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return (r.json().get("response") or "").strip() or None
+    except Exception:
+        return None
+
+async def _gen_code(websocket, agent_name, prompt, system, cancel_event, temperature=0.2, via_colab=False):
+    """Genere du code via le GPU Colab si via_colab ET Colab dispo, sinon via le modele local
+    (stream). Renvoie le texte complet. Repli local automatique si Colab ne repond pas."""
+    if via_colab and mem_get("colab_url"):
+        await websocket.send_json({"type":"agent_start","agent":"colab-gpu"})
+        await websocket.send_json({"type":"token","text":"⚡ délégué au GPU Colab...\n"})
+        txt = await asyncio.get_event_loop().run_in_executor(None, _colab_llm, system, prompt)
+        if txt is not None:
+            await websocket.send_json({"type":"token","text":txt})
+            return txt
+        await websocket.send_json({"type":"token","text":"(GPU Colab indisponible — je continue en local)\n"})
+    return await stream_agent(websocket, agent_name, prompt, system, cancel_event=cancel_event, temperature=temperature)
+
 async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     sid = sid_box["sid"]
     if len(prompt) > MAX_PROMPT_CHARS:  # tronque AVANT msg() -> l'utilisateur voit la coupe,
@@ -1155,6 +1192,15 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         todos[0]["active"] = True
         await websocket.send_json({"type":"todos","items":todos})
 
+    # ── Déléguer au GPU Colab ? sur demande explicite, OU gros projet (plan long /
+    # beaucoup de tâches). Le local (CPU) rame sur ces cas ; le GPU Colab est bien
+    # plus rapide. Repli local automatique si Colab est éteint (géré dans _gen_code).
+    use_colab_code = bool(_COLAB_ASK_RE.search(strip_accents(prompt.lower())))
+    big_project = use_colab_code or len(todos) >= 5 or len(plan) > 1500
+    if big_project and mem_get("colab_url"):
+        await websocket.send_json({"type":"file_created",
+            "name":"⚡ gros projet — génération déléguée au GPU Colab","size":""})
+
     # ── Phase 2 : Lire le code existant si c'est une modif/reprise ───
     existing = {}
     if editing and os.path.isdir(project_dir):
@@ -1181,7 +1227,8 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         f"Produis chaque fichier au format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE\n"
         f"{consigne}"
     )
-    code_resp = await stream_agent(websocket, agent_name, enriched, cancel_event=cancel_event)
+    code_resp = await _gen_code(websocket, agent_name, enriched, CODER_SYSTEM, cancel_event,
+                                via_colab=big_project)
     msg(sid, agent_name, "assistant", code_resp)
     if cancel_event.is_set():
         await websocket.send_json({"type":"done"}); return
@@ -1328,8 +1375,10 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                              f"{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
                              f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
                              f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
-                    fix_resp = await stream_agent(websocket, agent_name, fix_p, CODER_FIX_SYSTEM,
-                                                  cancel_event=cancel_event, temperature=fix_temp)
+                    # Bloqué (escalate) OU deja en mode Colab -> on delegue la correction au GPU.
+                    fix_resp = await _gen_code(websocket, agent_name, fix_p, CODER_FIX_SYSTEM,
+                                               cancel_event, temperature=fix_temp,
+                                               via_colab=(escalate or big_project))
                     if cancel_event.is_set():
                         break
 
