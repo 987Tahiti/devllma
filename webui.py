@@ -538,7 +538,12 @@ _HEAVY_MEDIA_RE = re.compile(
     r'\b(image|images|photo|photos|illustration|dessin|logo|visuel|banniere|avatar|'
     r'video|videos|clip|animation|rendu)\b')
 def is_heavy_media_request(prompt):
-    return bool(_HEAVY_MEDIA_RE.search(strip_accents(prompt.lower())))
+    low = strip_accents(prompt.lower())
+    # "jeu video"/"mini-jeu video"/"jeu de..." = un JEU a developper (projet), PAS une
+    # generation de video : le mot "jeu" desamorce le faux positif sur "video".
+    if re.search(r'\bjeu', low):
+        return False
+    return bool(_HEAVY_MEDIA_RE.search(low))
 
 def match_existing_project(prompt):
     """Retrouve le projet EXISTANT visé par la demande (nom entre « », ou nom present dans le texte).
