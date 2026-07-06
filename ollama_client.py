@@ -249,7 +249,11 @@ def check_ollama_ready():
     if not installed:
         print(f"[DEMARRAGE] ATTENTION : Ollama ({OLLAMA}) ne repond pas ou n'a aucun modele installe.")
         return
-    missing = [m for m in required if m not in installed]
+    # Ollama nomme les modeles avec un tag (":latest" par defaut) ; on compare en ignorant
+    # le tag pour ne pas signaler a tort "snowflake-arctic-embed2" comme manquant alors que
+    # "snowflake-arctic-embed2:latest" est bien installe (faux positif au demarrage).
+    installed_base = {n.split(":")[0] for n in installed}
+    missing = [m for m in required if m not in installed and m.split(":")[0] not in installed_base]
     if missing:
         print(f"[DEMARRAGE] ATTENTION : modele(s) manquant(s) dans Ollama : {', '.join(missing)} "
               f"— a telecharger via 'ollama pull <modele>' ou le panneau Modeles de l'interface.")
