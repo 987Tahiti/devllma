@@ -21,7 +21,9 @@ GIT       = "git"
 
 os.makedirs(BACKUPS, exist_ok=True)
 
-IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".backups"}
+IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".backups",
+               "build", "dist", "env", ".env", ".tox", "site-packages", ".mypy_cache",
+               ".pytest_cache", ".ruff_cache"}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -162,6 +164,21 @@ def extract_files(text):
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                 ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
+def _iter_py_files(project_dir):
+    """Itere (relpath, fullpath) sur CHAQUE .py du projet, SOUS-DOSSIERS INCLUS, en
+    ignorant les dossiers techniques (IGNORE_DIRS). Les checks statiques doivent voir
+    les projets multi-dossiers (app/main.py, app/database.py, que CODER_SYSTEM demande
+    justement) — sinon tous les garde-fous AST etaient silencieusement contournes pour
+    exactement les projets les plus susceptibles de tomber sur ces bugs (os.listdir ne
+    voyait que la racine)."""
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for f in sorted(files):
+            if f.endswith(".py"):
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, project_dir).replace("\\", "/")
+                yield rel, full
+
 def _assigned_names(target):
     """Noms lies par une cible d'affectation/boucle (for x in .., x,y = .., with .. as x)."""
     return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
@@ -223,10 +240,7 @@ def static_self_check(project_dir):
     erreur de parsing (syntaxe deja invalide, gere ailleurs par syntax_check) est
     simplement ignoree ici."""
     problems = []
-    for fname in sorted(os.listdir(project_dir)):
-        if not fname.endswith(".py"):
-            continue
-        fpath = os.path.join(project_dir, fname)
+    for fname, fpath in _iter_py_files(project_dir):
         try:
             src = open(fpath, encoding="utf-8").read()
             tree = ast.parse(src, filename=fname)
@@ -282,11 +296,9 @@ def _check_sqlalchemy_engine_args(project_dir):
     explicite avec la correction exacte est bien plus fiable ici. Detection AST sure :
     un appel a une fonction nommee create_engine avec un mot-cle check_same_thread."""
     problems = []
-    for fname in sorted(os.listdir(project_dir)):
-        if not fname.endswith(".py"):
-            continue
+    for fname, fpath in _iter_py_files(project_dir):
         try:
-            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+            tree = ast.parse(open(fpath, encoding="utf-8").read())
         except Exception:
             continue
         for node in ast.walk(tree):
@@ -335,30 +347,41 @@ def _check_cross_file_imports(project_dir):
     ne verifie QUE les modules LOCAUX du projet (un .py present dans project_dir) — jamais
     la stdlib ni les paquets pip (impossible a resoudre de facon fiable sans les importer)."""
     problems = []
-    # 1) Cartographie des noms exportes par chaque module local du projet
+    # 1) Cartographie des noms exportes par chaque module local du projet (sous-dossiers
+    #    inclus). Clef = nom de module (basename sans .py) car la convention DevLLMA impose
+    #    des imports PLATS ("from database import get_db"). Si deux dossiers ont un module
+    #    de meme nom, on UNIONNE leurs exports : accepter un nom defini dans l'un OU l'autre
+    #    evite un faux positif (qui declencherait a tort une correction).
     local_exports = {}
-    for fname in os.listdir(project_dir):
-        if not fname.endswith(".py"):
-            continue
+    for fname, fpath in _iter_py_files(project_dir):
         try:
-            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+            tree = ast.parse(open(fpath, encoding="utf-8").read())
         except Exception:
             return problems  # un fichier ne parse pas -> analyse peu fiable, on s'abstient
-        local_exports[fname[:-3]] = _module_exported_names(tree)
+        mod_base = os.path.basename(fname)[:-3]
+        local_exports.setdefault(mod_base, set()).update(_module_exported_names(tree))
     # 2) Verifie chaque import depuis un module local
-    for fname in sorted(os.listdir(project_dir)):
-        if not fname.endswith(".py"):
-            continue
+    for fname, fpath in _iter_py_files(project_dir):
         try:
-            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+            tree = ast.parse(open(fpath, encoding="utf-8").read())
         except Exception:
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom) or node.level:  # ignore imports relatifs (.mod)
                 continue
-            mod = (node.module or "").split(".")[0]
-            if mod not in local_exports:
-                continue  # pas un module local du projet -> non verifiable, on ignore
+            parts = (node.module or "").split(".")
+            # On ne verifie QUE les imports PLATS a un seul composant ("from database import X"),
+            # qui sont la convention DevLLMA (CODER_SYSTEM impose des imports plats sans prefixe de
+            # package) ET la forme des 2 vrais bugs constates (scanner, report_generator). Pour un
+            # import POINTE ("from app.core import settings"), le dernier composant peut etre un
+            # SOUS-MODULE (app/core/settings.py) et non un nom exporte par un fichier plat homonyme
+            # -> resoudre "app.core" vers un "core.py" plat sans rapport produisait un FAUX POSITIF
+            # (identifie en revue de code). On s'abstient donc sur les imports pointes.
+            if len(parts) != 1:
+                continue
+            mod = parts[0] if parts[0] in local_exports else None
+            if mod is None:
+                continue
             available = local_exports[mod]
             for alias in node.names:
                 if alias.name == "*":
@@ -634,6 +657,57 @@ class Skills:
             return None, "pyflakes non installé"
         _log_skill(proj, "lint", ok, out or "Aucun problème détecté")
         return ok, out or "Aucun problème détecté"
+
+
+# Codes Ruff FATAUX (famille F = pyflakes) : erreurs REELLES qui plantent a l'execution.
+# On ne garde QUE ceux-la pour ne jamais faire tourner la boucle de correction sur de la
+# cosmetique. Couvre les hallucinations que py_compile + les checks AST maison ratent :
+# nom non defini (F821), __all__ invalide (F822), variable locale avant affectation (F823),
+# format strings casses (F50x), comparaisons/assertions fautives (F63x), 'break' hors boucle...
+# F811 (redefinition) est VOLONTAIREMENT EXCLU : c'est du Python VALIDE a l'execution (la
+# derniere definition gagne) et il FAUSSE-POSITIVE sur des handlers de routes FastAPI de meme
+# nom (@app.get("/") def index / @app.get("/about") def index) — les deux routes s'enregistrent
+# via le decorateur ; le signaler declencherait une "correction" qui supprimerait une vraie route.
+# F401 (import inutilise) est exclu aussi : cosmetique, et un import peut servir a un EFFET DE BORD.
+_RUFF_FATAL = {"F821", "F822", "F823", "F831", "F632", "F501", "F502", "F503",
+               "F504", "F506", "F507", "F508", "F509", "F521", "F522", "F524", "F525",
+               "F701", "F702", "F704", "F706", "F707", "F601", "F602"}
+
+def lint_check(project_dir):
+    """Filet anti-hallucination AVANT execution (sub-seconde, sans LLM). Renvoie UNIQUEMENT les
+    erreurs FATALES (nom non defini, format string invalide...) a re-injecter dans la boucle de
+    correction. Ruff si dispo, sinon repli pyflakes.
+    NE MODIFIE JAMAIS les fichiers : le '--fix' initial (F401) supprimait en silence des imports
+    a EFFET DE BORD pourtant necessaires ('import models' pour que Base.metadata.create_all voie
+    les tables SQLAlchemy ; 'import readline'...) -> corruption d'un code deja correct (defaut
+    identifie en revue de code independante). On se contente donc de RAPPORTER.
+    Retourne une liste de lignes de diagnostic (vide = rien de fatal)."""
+    # Rapport concis des seules erreurs de la famille F (AUCUNE modification de fichier)
+    try:
+        ok, out = _run([PYTHON, "-m", "ruff", "check", "--select", "F",
+                        "--output-format", "concise", "."], project_dir, timeout=45)
+    except Exception:
+        out = "No module"
+        ok = False
+    if "No module" in (out or "") or "No such" in (out or ""):
+        # Repli pyflakes : on filtre pour matcher le set fatal de ruff — on EXCLUT le cosmetique
+        # (import inutilise F401, redefinition F811) pour ne pas declencher de fausse correction.
+        ok2, out2 = Skills.lint(project_dir)
+        if ok2 is None:  # pyflakes absent lui aussi
+            return []
+        lines = [l for l in (out2 or "").splitlines()
+                 if l.strip() and ":" in l
+                 and "imported but unused" not in l
+                 and "redefinition" not in l.lower()
+                 and "unable to detect undefined names" not in l]
+        return lines[:12]
+    # Ruff format concis : "chemin:ligne:col: CODE message" -> ne garde que les codes fatals
+    fatal = []
+    for line in (out or "").splitlines():
+        m = re.search(r'\b(F\d{3})\b', line)
+        if m and m.group(1) in _RUFF_FATAL:
+            fatal.append(line.strip())
+    return fatal[:12]
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -36,7 +36,10 @@ KEEP_ALIVE = -1
 # agent) et keep_alive=-1 le fige au num_ctx du premier chargeur. Si le warmup de l'agent
 # charge le modele en premier sans num_ctx, il retombe au defaut 4096 (constate apres reboot).
 NUM_CTX = 32768
-MAX_STEPS = 8
+# 14 (au lieu de 8) : les flux reels enchainent lire x3 -> editer x2 -> lancer -> verifier,
+# ce qui saturait la limite de 8 et forcait un resume premature en plein milieu d'une tache.
+# Le resume-a-la-limite borne toujours le pire cas.
+MAX_STEPS = 14
 # Modele VISION (multimodal) : lit ET comprend une image (captures, schemas, photos),
 # la ou l'OCR ne rend que le texte brut. Opt-in via le parametre `question` de read_image
 # pour ne pas ralentir le cas courant (lecture de texte = OCR, instantane). keep_alive=0 :
@@ -1134,12 +1137,15 @@ def warm_agent_cache():
     redemarrage paie ~6 min d'evaluation de prompt a froid (mesure sur ce CPU),
     ce qui depasse tous les timeouts et ressemble a une panne."""
     try:
+        from ollama_client import _opts
         _http.post(OLLAMA + "/api/chat", json={
             "model": AGENT_MODEL,
             "messages": [{"role": "system", "content": AGENT_SYSTEM},
                           {"role": "user", "content": "ping"}],
             "tools": TOOLS, "stream": False, "keep_alive": KEEP_ALIVE,
-            "options": {"num_predict": 1, "num_ctx": NUM_CTX},  # fixe le contexte des le warmup
+            # MEMES options que _chat_call (num_ctx/num_thread/num_batch/sampling) : le warmup
+            # doit charger le modele avec exactement les reglages du runtime, sinon inutile.
+            "options": _opts(num_predict=1),
         }, timeout=600)
         return True
     except Exception:
@@ -1147,12 +1153,16 @@ def warm_agent_cache():
 
 
 def _chat_call(messages, tools=None, temperature=0.3):
+    # Memes reglages CPU + echantillonnage que le pipeline de dev (num_thread/num_batch/
+    # sampling), via le helper partage d'ollama_client : coherence obligatoire car keep_alive=-1
+    # fige les parametres du premier appel qui charge le modele.
+    from ollama_client import _opts
     payload = {
         "model": AGENT_MODEL,
         "messages": messages,
         "stream": False,
         "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": temperature, "num_ctx": NUM_CTX},
+        "options": _opts(temperature=temperature),
     }
     if tools:
         payload["tools"] = tools
@@ -1239,9 +1249,16 @@ def run_agent_sync(prompt, history_text="", notify=None, should_stop=None):
                 except Exception: args = {}
             sig = (name, json.dumps(args, sort_keys=True))
             impl = TOOL_IMPL.get(name)
+            # Les outils LECTURE SEULE sont exemptes du blocage anti-repetition : re-lire
+            # un fichier APRES l'avoir modifie (verification post-edition) est un appel
+            # "identique" mais LEGITIME et souhaitable — le bloquer empechait justement
+            # l'etape verifier-apres-changement qu'on veut encourager. Seuls les outils a
+            # effet de bord (ecriture/exec/etc.) restent proteges contre les boucles.
+            _READONLY_TOOLS = {"read_file", "read_lines", "list_dir", "grep_search",
+                               "find_files", "read_image", "get_datetime"}
             if impl is None:
                 result = {"error": f"outil inconnu: {name}"}
-            elif sig in seen_calls:
+            elif sig in seen_calls and name not in _READONLY_TOOLS:
                 result = {"error": "appel identique déjà tenté — change d'approche, ne répète pas cet appel"}
             else:
                 seen_calls.add(sig)

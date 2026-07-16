@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from db import init, new_session, msg, history, list_sessions, mem_search, mem_index, mem_get, mem_set, stats as db_stats, delete_session, mem_list, mem_delete, mem_purge
 from agents import AGENTS, route, OLLAMA, has_dev_keywords, is_research_question, GREETINGS, _kw_match, strip_accents, is_trivial_snippet
-from skills import SnapshotManager, Skills, safety_check, security_scan, BrainMemory, extract_files as extract_files_robust, static_self_check
+from skills import SnapshotManager, Skills, safety_check, security_scan, BrainMemory, extract_files as extract_files_robust, static_self_check, lint_check
 try:
     from tools import read_image_text
 except Exception:
@@ -24,7 +24,7 @@ except Exception:
 from agent_core import run_agent_sync
 from ollama_client import (
     KEEP_ALIVE, BRAIN_MODEL, call_brain, preload_models, stream_agent,
-    _fetch_ollama_tags, handle_pull_model, check_ollama_ready, _http,
+    _fetch_ollama_tags, handle_pull_model, check_ollama_ready, _http, _opts,
 )
 import uvicorn
 
@@ -292,12 +292,15 @@ def record_lesson(initial_error, fix_summary, resolved, final_error):
     fire-and-forget (run_in_executor, jamais awaite) apres la boucle d'auto-correction :
     ne doit JAMAIS lever d'exception ni ralentir la reponse a l'utilisateur."""
     try:
-        if resolved:
-            ctx = (f"ERREUR RENCONTREE:\n{initial_error[:800]}\n\n"
-                   f"CORRECTION QUI A RESOLU LE PROBLEME:\n{fix_summary[:800]}")
-        else:
-            ctx = (f"ERREUR RENCONTREE (JAMAIS RESOLUE apres plusieurs tentatives):\n"
-                   f"{initial_error[:800]}\n\nDERNIER ETAT (toujours en echec):\n{final_error[:500]}")
+        # NE distiller une lecon QUE si le probleme a REELLEMENT ete resolu. Distiller un
+        # echec jamais corrige produisait une "regle" sans signal de justesse (le modele
+        # invente une explication a une erreur qu'il n'a pas su reparer), ensuite reinjectee
+        # dans tous les futurs projets similaires -> pollution du prompt avec de faux conseils
+        # (defaut identifie en revue de code : resolved=run_ok pouvait etre False).
+        if not resolved:
+            return
+        ctx = (f"ERREUR RENCONTREE:\n{initial_error[:800]}\n\n"
+               f"CORRECTION QUI A RESOLU LE PROBLEME:\n{fix_summary[:800]}")
         lesson = call_brain(ctx, system=LESSON_SYSTEM, max_tokens=220)
         lesson = (lesson or "").strip()
         # call_brain() ne leve JAMAIS d'exception sur panne Ollama : il renvoie une CHAINE
@@ -1131,6 +1134,53 @@ def purge_memories(kind: str = ""):
     mem_purge(kind or None)
     return {"ok": True}
 
+_PIPELINE_LOG = os.path.join(os.path.dirname(WORKSPACE), "logs", "pipeline_runs.jsonl")
+
+def _log_pipeline_run(row):
+    """Append-only, best-effort : une ligne JSONL par run du pipeline de dev. Ne doit
+    JAMAIS lever (sinon casserait la reponse). Lu par /pipeline_stats."""
+    try:
+        os.makedirs(os.path.dirname(_PIPELINE_LOG), exist_ok=True)
+        row = {**row, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        with open(_PIPELINE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+@app.get("/pipeline_stats")
+def pipeline_stats(limit: int = 500):
+    """Agrege la telemetrie des runs de dev : taux run_ok, iterations moyennes, part Colab.
+    Repond au besoin 'quel est mon taux de reussite reel maintenant' sans rejouer un banc."""
+    if not os.path.exists(_PIPELINE_LOG):
+        return {"runs": 0, "note": "aucun run enregistre pour l'instant"}
+    rows = []
+    try:
+        with open(_PIPELINE_LOG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try: rows.append(json.loads(line))
+                    except Exception: pass
+    except Exception as e:
+        return {"error": str(e)}
+    rows = rows[-limit:]
+    n = len(rows)
+    if not n:
+        return {"runs": 0}
+    ok = sum(1 for r in rows if r.get("run_ok"))
+    with_files = sum(1 for r in rows if r.get("files_written"))
+    iters = [r.get("iterations", 0) for r in rows]
+    return {
+        "runs": n,
+        "run_ok": ok,
+        "run_ok_pct": round(100 * ok / n, 1),
+        "with_files": with_files,
+        "avg_iterations": round(sum(iters) / n, 2),
+        "colab_runs": sum(1 for r in rows if r.get("colab")),
+        "edits": sum(1 for r in rows if r.get("editing")),
+        "last_10": rows[-10:],
+    }
+
 @app.post("/restore/{snapshot_id}")
 def restore_snapshot(snapshot_id: int):
     """Restaure un snapshot precedent (rollback) d'un projet."""
@@ -1460,7 +1510,10 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # ── Lecons auto-apprises (kind="lesson", cf. record_lesson) — auto-correction :
     # DevLLMA reinjecte ici ce qu'il a lui-meme distille de ses echecs passes, sans
     # qu'un humain ait besoin de repatcher CODER_SYSTEM a la main a chaque bug trouve.
-    lessons = await asyncio.get_event_loop().run_in_executor(None, lambda: mem_search(prompt, 4, kind="lesson", min_score=0.35))
+    # min_score 0.50 (au lieu de 0.35) + k=3 : ne reinjecter que des lecons VRAIMENT proches
+    # de la demande. Un seuil trop bas ajoutait des conseils peu pertinents qui gonflaient le
+    # prompt (couteux en prompt-eval CPU) et pouvaient egarer le modele.
+    lessons = await asyncio.get_event_loop().run_in_executor(None, lambda: mem_search(prompt, 3, kind="lesson", min_score=0.50))
     lessons_note = ""
     if lessons:
         lessons_note = "\n\nLECONS AUTO-APPRISES (bugs deja rencontres et corriges sur des projets similaires — EVITE-LES) :\n" + "\n".join(
@@ -1500,8 +1553,13 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # ── Phase 2 : Lire le code existant si c'est une modif/reprise ───
     existing = {}
     if editing and os.path.isdir(project_dir):
-        # executor : lecture disque de tout le projet, ne pas geler la boucle asyncio
-        existing = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+        # executor : lecture disque de tout le projet, ne pas geler la boucle asyncio.
+        # Sur la voie EDITION la consigne est "reecris les fichiers changes EN ENTIER" :
+        # lire avec le cap serre par defaut (1600 car) tronquait les fichiers >1600 car,
+        # que le modele reecrivait alors depuis une version amputee -> perte silencieuse
+        # de la fin du fichier. On lit donc les corps COMPLETS (cap large) sur ce chemin.
+        existing = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: read_project(project_dir, max_chars=12000, total_budget=48000, max_files=20))
     if existing:
         ctx_note = ("\n\nCODE EXISTANT DU PROJET (tu DOIS partir de ce code et le MODIFIER, "
                     "PAS repartir de zéro ; conserve ce qui marche, applique seulement la demande) :\n"
@@ -1539,6 +1597,11 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # ── Phase 4 : Écrire les fichiers (avec sauvegarde) ──────────────
     files = extract_files(code_resp)
     run_ok = None
+    # Telemetrie du run (une ligne JSONL en fin de pipeline -> /pipeline_stats). Permet de
+    # connaitre le taux de reussite reel EN PROD sans rejouer le banc de 60 tests.
+    _telemetry = {"project": project_name, "editing": bool(editing),
+                  "files_written": len(files), "big_project": bool(big_project),
+                  "colab": bool(big_project and mem_get("colab_url")), "iterations": 0}
     if not files and code_resp and code_resp.strip():
         # Constate (projet "api_04") : le codeur a repondu (souvent une reponse
         # tronquee/incomplete) mais AUCUN fichier n'a pu en etre extrait -> jusqu'ici
@@ -1624,6 +1687,24 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             if fixed:
                 await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
 
+        # ── Lint FATAL (ruff famille F, sinon pyflakes) — zero appel LLM, sub-seconde ──
+        # Attrape les hallucinations que py_compile et les checks AST maison ratent : nom
+        # non defini (F821), imports casses, format strings invalides. Le smoke-test de 15s
+        # n'atteint souvent jamais la ligne fautive -> le lint la voit sans executer.
+        lint_fatal = await asyncio.get_event_loop().run_in_executor(None, lint_check, project_dir)
+        if lint_fatal and not cancel_event.is_set():
+            await websocket.send_json({"type":"file_created","name":f"⚠ Lint: {len(lint_fatal)} erreur(s) fatale(s) — correction rapide","size":""})
+            cur = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+            fix_p = ("ERREURS DETECTEES PAR LE LINTER (ruff/pyflakes, avant execution) :\n" +
+                     "\n".join(lint_fatal) +
+                     f"\n\nCODE ACTUEL:\n{format_context(cur)}\n\n"
+                     f"Corrige ces erreurs (souvent : nom/variable non defini, import manquant ou "
+                     f"mal nomme). Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
+            fix_resp = await stream_agent(websocket, agent_name, fix_p, coder_fix_system_dyn, cancel_event=cancel_event)
+            fixed = extract_files(fix_resp)
+            if fixed:
+                await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
+
         # Deduire requirements.txt des imports (le modele l'oublie souvent) AVANT l'install
         added_deps = await asyncio.get_event_loop().run_in_executor(None, derive_requirements, project_dir)
         if added_deps:
@@ -1662,6 +1743,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                 for iteration in range(1, 4):
                     if cancel_event.is_set():
                         break
+                    _telemetry["iterations"] = iteration
                     await websocket.send_json({"type":"iter_start","n":iteration})
 
                     # Detection de blocage : si la MEME erreur persiste malgre la correction
@@ -1726,6 +1808,22 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, applied)
                         last_fix_summary = "\n".join(f"### {fname}\n{code[:600]}" for fname, code in applied)
 
+                    # Re-validation STATIQUE avant de relancer (bien moins cher qu'un cycle
+                    # install+execute) : une "correction" peut reintroduire une collision de
+                    # nom, casser un import, ou laisser un nom non defini. Si un defaut statique
+                    # subsiste, on saute l'execution et on renvoie ces messages a l'iteration
+                    # suivante pour reparer directement — sans gaspiller un run complet.
+                    stat2 = await asyncio.get_event_loop().run_in_executor(None, syntax_check, project_dir)
+                    if not stat2:
+                        stat2 = await asyncio.get_event_loop().run_in_executor(None, static_self_check, project_dir)
+                    if not stat2:
+                        stat2 = await asyncio.get_event_loop().run_in_executor(None, lint_check, project_dir)
+                    if stat2:
+                        run_ok, run_out = False, ("Defaut statique persistant apres correction :\n" + "\n".join(stat2[:8]))
+                        entry = None
+                        await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
+                        continue  # compte comme une iteration : la boucle ne peut pas tourner a l'infini
+
                     run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
                         None, execute_project, project_dir
                     )
@@ -1748,6 +1846,10 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     for i,t in enumerate(todos):
         todos[i]["done"]=True; todos[i]["active"]=False
     if todos: await websocket.send_json({"type":"todos","items":todos})
+
+    # Telemetrie du run (append JSONL, best-effort en executor : ne doit jamais casser la reponse)
+    _telemetry["run_ok"] = bool(run_ok)
+    await asyncio.get_event_loop().run_in_executor(None, lambda: _log_pipeline_run(_telemetry))
 
     # Envoyer liste projets mise à jour (force=True : fichiers peut-etre ecrits juste avant)
     await asyncio.get_event_loop().run_in_executor(None, lambda: load_workspace_memory(force=True))
@@ -1847,8 +1949,13 @@ async def ws_handler(websocket: WebSocket):
                 # requests.post direct ici gelait toutes les WebSocket actives pendant l'appel).
                 def _preload_one(m):
                     try:
+                        # options=_opts() OBLIGATOIRE : sans ca Ollama charge le modele a son
+                        # defaut (num_ctx=4096) et keep_alive=-1 le FIGE la -> ca jetait le cache
+                        # KV prechauffe a 32k et forçait un rechargement a froid (~min) au prochain
+                        # appel reel (defaut identifie en revue de code). Memes options que partout.
                         _http.post(OLLAMA+"/api/generate",
-                                      json={"model":m,"prompt":"","keep_alive":KEEP_ALIVE}, timeout=5)
+                                      json={"model":m,"prompt":"","keep_alive":KEEP_ALIVE,
+                                            "options":_opts()}, timeout=5)
                     except Exception: pass
                 asyncio.get_event_loop().run_in_executor(None, _preload_one, model)
                 await websocket.send_json({"type":"agent_start","agent":"brain"})

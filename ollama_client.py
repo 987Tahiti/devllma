@@ -30,6 +30,26 @@ NUM_CTX = 32768
 # mais bien plus capable ; mesuré ~2x plus rapide que qwen2.5-coder:7b sur ce CPU, cf bench_models.py)
 BRAIN_MODEL = "qwen3-coder:30b"
 
+# ── Reglages CPU + echantillonnage partages (DOIVENT etre identiques dans TOUS les
+#    dicts "options" : avec keep_alive=-1, Ollama fige les parametres du PREMIER appel
+#    qui charge le modele ; une divergence entre warmup et runtime serait ignoree).
+# num_thread=8 : les 8 coeurs PHYSIQUES de ce i5-12450H (4P+4E, 12 logiques). Au-dela on
+#    tape dans l'HyperThreading -> contention memoire sur ce modele MoE bande-passante-lie
+#    (a re-benchmarker si le CPU change). On laisse des coeurs logiques au process FastAPI.
+# num_batch=1024 : double le defaut (512) -> prefill (la phase qui coute les minutes a froid)
+#    bien mieux vectorise sur CPU. RAM OK sur ce poste (34 Go, ~25 libres).
+# Sampling deterministe anti-hallucination : temperature basse, top_p/top_k/repeat_penalty
+#    aux valeurs recommandees Qwen. repeat_penalty plafonne a 1.05 (au-dela ca casse le code :
+#    indentation, self., imports, accolades se repetent legitimement).
+_CPU_OPTS = {"num_thread": 8, "num_batch": 1024}
+_SAMPLING = {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
+
+def _opts(**overrides):
+    """Construit un dict options en fusionnant reglages CPU + echantillonnage + surcharges."""
+    o = {"num_ctx": NUM_CTX, **_CPU_OPTS, **_SAMPLING}
+    o.update(overrides)
+    return o
+
 _http = requests.Session()  # connexion reutilisee (keep-alive) pour les appels Ollama
 
 
@@ -45,7 +65,7 @@ def call_brain(prompt, system=None, max_tokens=450):
             r = _http.post(OLLAMA+"/api/generate", json={
                 "model":BRAIN_MODEL, "system":s,
                 "prompt":prompt, "stream":False, "keep_alive":KEEP_ALIVE,
-                "options":{"temperature":0.3,"num_predict":max_tokens,"num_ctx":NUM_CTX}
+                "options":_opts(temperature=0.3, num_predict=max_tokens)
             }, timeout=300)
             body = r.json()
             if "error" in body:
@@ -66,7 +86,7 @@ def preload_models():
         try:
             _http.post(OLLAMA+"/api/generate",
                           json={"model":m,"prompt":"","keep_alive":KEEP_ALIVE,
-                                "options":{"num_ctx":NUM_CTX}},  # charge le modele au bon contexte des le warmup
+                                "options":_opts()},  # charge le modele avec les MEMES reglages que le runtime
                           timeout=120)
         except Exception:
             pass
@@ -83,7 +103,7 @@ def _ollama_stream_worker(cfg, sys_p, prompt, out_q, stop_flag, temperature=0.2)
                 r = _http.post(OLLAMA+"/api/generate", json={
                     "model":cfg["model"], "system":sys_p,
                     "prompt":prompt, "stream":True, "keep_alive":KEEP_ALIVE,
-                    "options":{"temperature":temperature,"num_predict":4000,"num_ctx":NUM_CTX}
+                    "options":_opts(temperature=temperature, num_predict=4000)
                 }, stream=True, timeout=(10, 600))
                 break
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
