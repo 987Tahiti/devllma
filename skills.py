@@ -9,7 +9,7 @@ Fournit :
 - security_scan : détecte les failles dans le code généré (injections, secrets, eval…)
 - BrainMemory : mémoire persistante du cerveau (SQLite), chargée à chaque dev
 """
-import os, re, shutil, subprocess, sqlite3, json
+import os, re, shutil, subprocess, sqlite3, json, ast
 from datetime import datetime
 
 DEVLLMA   = r"C:\Devllma"
@@ -85,6 +85,32 @@ def extract_files(text):
         if out:
             return out
 
+    # ---- Fallback #FILE sans ###ENDFILE (marqueur de fin oublie/tronque) --
+    # Constate (projet "api_04", recettes de cuisine) : le modele emet ###FILE:
+    # pour chaque fichier mais oublie le tout DERNIER ###ENDFILE (reponse tronquee
+    # ou generation interrompue) -> le regex strict ci-dessus ne matche RIEN et
+    # l'INTEGRALITE du code genere est perdue silencieusement, sans aucune erreur
+    # visible. On decoupe alors sur les seuls marqueurs ###FILE:, chaque fichier
+    # allant jusqu'au prochain marqueur (ou la fin du texte).
+    loose = list(re.finditer(r'#{2,3}\s*FILE:\s*([^\n]+?)\s*\n', text, re.IGNORECASE))
+    if loose:
+        out, seen = [], set()
+        for i, m in enumerate(loose):
+            name = m.group(1).strip().strip("`*").replace("\\", "/").lstrip("/")
+            start = m.end()
+            end = loose[i + 1].start() if i + 1 < len(loose) else len(text)
+            body = text[start:end]
+            body = re.sub(r'#{2,3}\s*ENDFILE\s*$', '', body, flags=re.IGNORECASE).strip()
+            body = re.sub(r'^```[\w+-]*\r?\n', '', body)
+            body = re.sub(r'\n```\s*$', '', body)
+            body = re.sub(r'^<(?:code|pre)>\s*\r?\n?', '', body, flags=re.IGNORECASE)
+            body = re.sub(r'\r?\n?</(?:code|pre)>\s*$', '', body, flags=re.IGNORECASE)
+            body = body.strip()
+            if name and len(body) > 0 and name not in seen:
+                out.append((name, body)); seen.add(name)
+        if out:
+            return out
+
     # ---- Fallback markdown -------------------------------------------------
     files, seen = [], set()
     # Repère tous les blocs de code avec leur position
@@ -128,6 +154,224 @@ def extract_files(text):
                 if n == fname:
                     files[i] = (n, c + "\n\n" + code); break
     return files
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  static_self_check — analyse AST rapide, SANS appel LLM (auto-correction)
+# ════════════════════════════════════════════════════════════════════════════
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+def _assigned_names(target):
+    """Noms lies par une cible d'affectation/boucle (for x in .., x,y = .., with .. as x)."""
+    return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+def _scan_function_body(func_node, shadow_name):
+    """Cherche un Call(shadow_name) dans le corps DIRECT de func_node, sans jamais
+    descendre dans un sous-scope (fonction/lambda/comprehension imbriquee) qui a sa
+    PROPRE resolution de noms — une closure ou une comprehension peuvent re-lier ou
+    capturer ce nom differemment, et le determiner avec certitude demanderait une
+    vraie analyse de scope. Par prudence (un faux positif ici POURRAIT casser du code
+    correct via la correction automatique), on ignore ces sous-arbres plutot que de
+    risquer une fausse alerte (constate en revue : closures, comprehensions et boucles
+    for qui re-lient le nom localement produisaient des faux positifs a 100%).
+    Retourne None si le nom est RE-LIE ailleurs dans le corps direct (for/assign/with) —
+    dans ce cas la resolution reelle est trop ambigue, on prefere ne rien signaler."""
+    rebound = False
+    call_hit = None
+
+    def visit(node):
+        nonlocal rebound, call_hit
+        if isinstance(node, _SCOPE_NODES):
+            return  # nouveau scope : ne pas descendre, resolution de nom potentiellement differente
+        if isinstance(node, (ast.For, ast.AsyncFor)) and shadow_name in _assigned_names(node.target):
+            rebound = True
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if shadow_name in _assigned_names(t):
+                    rebound = True
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.target is not None:
+            if shadow_name in _assigned_names(node.target):
+                rebound = True
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            if shadow_name in _assigned_names(node.optional_vars):
+                rebound = True
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == shadow_name and call_hit is None):
+            call_hit = node
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    for child in ast.iter_child_nodes(func_node):
+        visit(child)
+    return None if rebound else call_hit
+
+def static_self_check(project_dir):
+    """Detecte par analyse AST (pas d'inference, quasi instantane) la classe de bug
+    la plus couteuse constatee au banc de tests (14/07/2026) : un nom LOCAL (fonction
+    de route, parametre) qui porte EXACTEMENT le meme nom qu'une fonction importee et
+    qui est ensuite APPELE comme une fonction dans le meme scope -> le nom local ecrase
+    l'import, l'appel invoque le mauvais objet (RecursionError si c'est la fonction qui
+    s'appelle elle-meme, TypeError 'X object is not callable' si c'est un parametre).
+    Rencontre sous 2 formes independantes (route FastAPI qui rappelle le CRUD du meme
+    nom ; flag CLI booleen qui porte le nom de la fonction qu'il declenche) -> pattern
+    generalisable, detectable sans jamais executer le code.
+    Scope-aware (cf. _scan_function_body) : ignore closures/comprehensions/boucles qui
+    re-lient le nom localement, pour eviter les faux positifs sur du code idiomatique
+    correct (constate en revue de code independante avant mise en prod).
+    Retourne une liste de descriptions (vide si rien trouve). Best-effort : toute
+    erreur de parsing (syntaxe deja invalide, gere ailleurs par syntax_check) est
+    simplement ignoree ici."""
+    problems = []
+    for fname in sorted(os.listdir(project_dir)):
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(project_dir, fname)
+        try:
+            src = open(fpath, encoding="utf-8").read()
+            tree = ast.parse(src, filename=fname)
+        except Exception:
+            continue
+
+        imported_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imported_names.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_names.add(alias.asname or alias.name.split(".")[0])
+        if not imported_names:
+            continue
+
+        # FunctionDef ET AsyncFunctionDef : les routes FastAPI (idiome dominant) sont
+        # presque toujours "async def" — un check limite a FunctionDef les ratait toutes
+        # (constate en revue de code : "async def create_user(user): return create_user(user)"
+        # passait inapercu, alors que l'equivalent synchrone etait detecte).
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            local_names = ({node.name} | {a.arg for a in node.args.args}
+                           | {a.arg for a in node.args.kwonlyargs})
+            shadowed = local_names & imported_names
+            if not shadowed:
+                continue
+            for shadow_name in shadowed:
+                hit = _scan_function_body(node, shadow_name)
+                if hit is not None:
+                    role = "le nom de la fonction" if shadow_name == node.name else "un parametre"
+                    problems.append(
+                        f"{fname}, fonction '{node.name}' (ligne {node.lineno}) : '{shadow_name}' est "
+                        f"{role} ET porte EXACTEMENT le meme nom qu'un import de ce fichier — l'appel "
+                        f"'{shadow_name}(...)' ligne {hit.lineno} invoque tres probablement {shadow_name} "
+                        f"local (parametre ou la fonction elle-meme), PAS l'import prevu. Renomme le "
+                        f"parametre/la fonction locale (ex: suffixe _flag/_route) ou importe le module "
+                        f"entier et appelle-le via prefixe (module.{shadow_name}(...))."
+                    )
+    problems.extend(_check_cross_file_imports(project_dir))
+    problems.extend(_check_sqlalchemy_engine_args(project_dir))
+    return problems
+
+
+def _check_sqlalchemy_engine_args(project_dir):
+    """Detecte 'create_engine(..., check_same_thread=...)' -> TypeError au demarrage
+    ('Invalid argument check_same_thread sent to create_engine'). check_same_thread est
+    un argument du DBAPI sqlite3, PAS de create_engine : il doit passer par connect_args.
+    Constate 3 fois independamment au banc de tests (api_03, social_01, social_07) et la
+    boucle d'auto-correction n'a JAMAIS reussi a le corriger seule -> un check statique
+    explicite avec la correction exacte est bien plus fiable ici. Detection AST sure :
+    un appel a une fonction nommee create_engine avec un mot-cle check_same_thread."""
+    problems = []
+    for fname in sorted(os.listdir(project_dir)):
+        if not fname.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else None)
+            if name != "create_engine":
+                continue
+            if any(kw.arg == "check_same_thread" for kw in node.keywords):
+                problems.append(
+                    f"{fname} (ligne {node.lineno}) : create_engine(..., check_same_thread=...) provoque "
+                    f"un TypeError au demarrage. 'check_same_thread' est un argument du DBAPI sqlite3, PAS "
+                    f"de create_engine. Corrige en le passant via connect_args : "
+                    f"create_engine(URL, connect_args={{'check_same_thread': False}}). Retire-le des "
+                    f"arguments directs de create_engine."
+                )
+    return problems
+
+
+def _module_exported_names(tree):
+    """Noms disponibles au niveau module (importables depuis l'exterieur) : fonctions,
+    classes, variables de niveau module, et ce que le module lui-meme importe (re-export)."""
+    names = set()
+    for node in tree.body:  # niveau module UNIQUEMENT (pas ast.walk : evite les noms internes)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+def _check_cross_file_imports(project_dir):
+    """Detecte AVANT execution un 'from <module_local> import <nom>' ou <nom> N'EST PAS
+    defini dans ce module local -> ImportError garanti au demarrage (constate a 2 reprises
+    independantes au banc de tests : main.py importait 'scan_network'/'generate_report'
+    alors que le module fournissait des fonctions aux noms DIFFERENTS). Purement statique,
+    ne verifie QUE les modules LOCAUX du projet (un .py present dans project_dir) — jamais
+    la stdlib ni les paquets pip (impossible a resoudre de facon fiable sans les importer)."""
+    problems = []
+    # 1) Cartographie des noms exportes par chaque module local du projet
+    local_exports = {}
+    for fname in os.listdir(project_dir):
+        if not fname.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+        except Exception:
+            return problems  # un fichier ne parse pas -> analyse peu fiable, on s'abstient
+        local_exports[fname[:-3]] = _module_exported_names(tree)
+    # 2) Verifie chaque import depuis un module local
+    for fname in sorted(os.listdir(project_dir)):
+        if not fname.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(project_dir, fname), encoding="utf-8").read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level:  # ignore imports relatifs (.mod)
+                continue
+            mod = (node.module or "").split(".")[0]
+            if mod not in local_exports:
+                continue  # pas un module local du projet -> non verifiable, on ignore
+            available = local_exports[mod]
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                if alias.name not in available:
+                    problems.append(
+                        f"{fname} (ligne {node.lineno}) : 'from {node.module} import {alias.name}' "
+                        f"mais le module local '{mod}.py' ne definit PAS '{alias.name}' "
+                        f"(il expose : {', '.join(sorted(available)) or 'rien'}). ImportError garanti au "
+                        f"demarrage. Corrige le nom importe pour qu'il corresponde a une fonction/classe "
+                        f"REELLEMENT definie dans {mod}.py (ou ajoute cette definition dans {mod}.py)."
+                    )
+    return problems
 
 
 # ════════════════════════════════════════════════════════════════════════════

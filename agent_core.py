@@ -45,12 +45,20 @@ MAX_STEPS = 8
 VISION_MODEL = "qwen2.5vl:7b"
 VISION_KEEP_ALIVE = 0
 
-# Chemins REELS resolus dynamiquement (meme process/compte que le service DevLLMA) —
-# sans ca, le modele hallucine des chemins generiques ("C:\Users\Utilisateur\...")
-# qui n'existent pas sur ce poste : write_file y ecrit quand meme (creation des
-# dossiers manquants) et le modele rapporte un succes alors que le fichier a
-# atterri au mauvais endroit (faux succes, cf. HANDOFF.md).
-HOME_DIR = os.path.expanduser("~")
+# Chemins REELS de l'utilisateur INTERACTIF (Admin), en DUR — sans ca, le modele
+# hallucine des chemins generiques ("C:\Users\Utilisateur\...") qui n'existent pas
+# sur ce poste : write_file y ecrit quand meme (creation des dossiers manquants) et
+# le modele rapporte un succes alors que le fichier a atterri au mauvais endroit
+# (faux succes, cf. HANDOFF.md).
+# NE PAS deriver dynamiquement via os.path.expanduser("~")/Path.home() : ca resolvait
+# correctement tant que le service DevLLMA tournait sous la session interactive Admin,
+# mais depuis que la tache planifiee DevLLMAWeb tourne en compte SYSTEM (evite de
+# stocker le mot de passe Windows), ces appels retournent le profil FANTOME de SYSTEM
+# (C:\Windows\system32\config\systemprofile) au lieu du bureau reel de l'utilisateur —
+# constate en prod : "genere une image et copie-la sur le bureau" atterrissait dans
+# system32 (acces refuse, dossier systeme protege). Le compte interactif de ce poste
+# est Admin ; son bureau ne bouge pas, un chemin en dur est donc fiable ici.
+HOME_DIR = r"C:\Users\Admin"
 DESKTOP_DIR = os.path.join(HOME_DIR, "Desktop")
 WORKSPACE_DIR = r"C:\Devllma\workspace"
 
@@ -907,23 +915,77 @@ def _tool_open_path(args):
 # se configurent UNE fois (memorisees en base) puis l'agent appelle l'outil tout seul.
 _MEDIA_EXT = {"image": "png", "video": "mp4"}
 
+# Enrichissement QUALITE du prompt image : ajoute des descripteurs de rendu et surtout
+# d'anatomie (mains a 5 doigts...) — le defaut FLUX.1-schnell (~4 etapes, optimise vitesse)
+# batclait les details, notamment les mains (constate sur un rendu utilisateur). Ces termes
+# poussent le modele vers plus de soin. On n'empile PAS si le prompt est deja enrichi.
+_IMG_QUALITY_SUFFIX = ("highly detailed, intricate details, sharp focus, masterpiece, best quality, "
+                       "professional artwork, anatomically correct hands, five fingers per hand, "
+                       "detailed symmetrical face, clean linework, coherent composition")
+# Prompt NEGATIF : liste des artefacts a bannir. N'est REELLEMENT exploite que par les
+# modeles a CFG classique (SDXL...) ; FLUX (schnell/dev) est distille sans guidage negatif,
+# donc on ne le lui envoie pas (il l'ignorerait ou renverrait une erreur).
+_IMG_NEGATIVE = ("bad hands, extra fingers, missing fingers, fused fingers, deformed hands, "
+                 "mutated hands, extra limbs, malformed limbs, deformed face, disfigured, "
+                 "blurry, lowres, low quality, jpeg artifacts, watermark, text, signature, "
+                 "cropped, out of frame, bad anatomy, bad proportions, ugly")
+
+def _enhance_image_prompt(prompt):
+    low = prompt.lower()
+    if any(t in low for t in ("highly detailed", "masterpiece", "best quality")):
+        return prompt  # deja enrichi -> ne pas empiler les memes termes
+    return f"{prompt}, {_IMG_QUALITY_SUFFIX}"
+
+def _hf_params_for(model, params):
+    """Parametres de generation adaptes au MODELE (les reglages qualite different selon
+    la famille). Surchargeables via params (steps/guidance/width/height/negative_prompt)."""
+    m = (model or "").lower()
+    p = {"width": int(params.get("width", 1024)), "height": int(params.get("height", 1024))}
+    if "schnell" in m:
+        # schnell : distille pour 1-4 etapes, guidage distille -> ni guidance ni negatif utiles.
+        p["num_inference_steps"] = int(params.get("steps", 6))
+    elif "flux" in m:
+        # FLUX.1-dev : bien plus de detail que schnell, guidance distille (~3.5).
+        p["num_inference_steps"] = int(params.get("steps", 30))
+        p["guidance_scale"] = float(params.get("guidance", 3.5))
+    else:
+        # SDXL et modeles CFG classiques : le prompt NEGATIF corrige efficacement les mains.
+        p["num_inference_steps"] = int(params.get("steps", 35))
+        p["guidance_scale"] = float(params.get("guidance", 7.0))
+        p["negative_prompt"] = params.get("negative_prompt") or _IMG_NEGATIVE
+    return p
+
 def _hf_image_backend(prompt, params):
     """Image via Hugging Face Inference Providers (routeur actuel ; l'ancien
     api-inference.huggingface.co est retire). Gratuit avec credits limites.
-    -> (bytes, ext) ou None. FLUX.1-schnell : rapide et dispo sur hf-inference."""
+    -> (bytes, ext) ou None.
+    QUALITE D'ABORD : on tente une liste de modeles dans l'ordre et le 1er qui repond
+    gagne. Defaut = FLUX.1-dev (bien plus detaille que schnell) -> repli SDXL (qui, lui,
+    exploite le prompt negatif contre les mains ratees) -> repli FLUX.1-schnell (rapide,
+    garanti dispo, comportement historique). Un modele force via hf_image_model court-
+    circuite la liste."""
     key = mem_get("hf_token")
     if not key:
         return None
-    model = mem_get("hf_image_model") or "black-forest-labs/FLUX.1-schnell"
-    try:
-        r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
-                       headers={"Authorization": f"Bearer {key}", "Accept": "image/png"},
-                       json={"inputs": prompt}, timeout=120)
-    except requests.RequestException:
-        return None
-    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-        return r.content, "png"
-    return None  # 402 (credits epuises), 401 (cle), 503 (chargement)... -> repli/erreur
+    configured = mem_get("hf_image_model")
+    models = [configured] if configured else [
+        "black-forest-labs/FLUX.1-dev",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        "black-forest-labs/FLUX.1-schnell",
+    ]
+    for model in models:
+        payload = {"inputs": prompt, "parameters": _hf_params_for(model, params)}
+        try:
+            r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
+                           headers={"Authorization": f"Bearer {key}", "Accept": "image/png"},
+                           json=payload, timeout=180)
+        except requests.RequestException:
+            continue  # modele suivant
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            return r.content, "png"
+        # 402 (credits), 401 (cle), 403 (modele gated non accepte), 404, 503 (chargement)
+        # -> on tente le modele suivant de la liste plutot que d'echouer tout de suite.
+    return None
 
 def _colab_backend(task, prompt, params):
     """Image/video via le worker GPU Colab (si configure). -> (bytes, ext) ou None."""
@@ -967,7 +1029,14 @@ def _tool_generate_media(args):
         v = (args.get(k) or "").strip()
         if v:
             mem_set(k, v.rstrip("/") if k == "colab_url" else v)
-    params = args.get("params") or {}
+    params = dict(args.get("params") or {})
+    # Enrichissement qualite du prompt image (mains/details) — desactivable via params.enhance=False.
+    # Fait UNE fois ici pour que les DEUX backends (HF + Colab) en beneficient identiquement.
+    if task == "image" and params.get("enhance") is not False:
+        prompt = _enhance_image_prompt(prompt)
+    # Prompt negatif par defaut pour le backend Colab (diffusers/SDXL l'exploite) si non fourni.
+    if task == "image" and "negative_prompt" not in params:
+        params["negative_prompt"] = _IMG_NEGATIVE
     data = ext = backend = None
     # 1) API hebergee (toujours dispo) — image via HF gratuit
     if task == "image":

@@ -60,3 +60,6 @@ __pycache__/
 
 # Artefacts d'evaluation locaux
 eval_results.json
+
+# Sortie regenerable du banc de tests Colab (artefact, pas source)
+colab_60_results.json

@@ -16,7 +16,9 @@ import asyncio, json, os, re, sys, time
 import websockets
 
 URI = "ws://127.0.0.1:8080/ws"
-DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
+DESKTOP = r"C:\Users\Admin\Desktop"  # en dur : os.path.expanduser("~") resout au profil
+                                     # SYSTEM fantome quand ce script tourne dans le meme
+                                     # contexte que le service DevLLMAWeb (tache SYSTEM)
 EVAL_DIR = r"C:\Devllma\workspace\_eval"
 RESULTS_FILE = r"C:\Devllma\eval_results.json"
 

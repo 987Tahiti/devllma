@@ -143,6 +143,9 @@ select{margin-left:auto;background:var(--sf);border:1px solid var(--bd);color:va
 .tok-kw{color:#ff7b72}.tok-str{color:#a5d6ff}.tok-com{color:#8b949e;font-style:italic}.tok-num{color:#79c0ff}.tok-fn{color:#d2a8ff}
 /* Vitesse generation */
 #speed-chip{font-size:.6rem;font-family:monospace;color:var(--gn);padding:2px 7px;border-radius:3px;background:#22c55e12;border:1px solid #22c55e30;display:none}
+#colab-chip{font-size:.6rem;font-family:monospace;padding:2px 7px;border-radius:3px;border:1px solid;display:none;cursor:default}
+#colab-chip.up{color:var(--gn);background:#22c55e12;border-color:#22c55e30}
+#colab-chip.down{color:var(--rd);background:#ef444412;border-color:#ef444430}
 /* Stop / regenerer */
 #stopBtn{background:var(--rd);color:#fff;border:none;border-radius:8px;padding:0 13px;font-size:.86rem;cursor:pointer;font-weight:600;height:40px;white-space:nowrap;display:none}
 #stopBtn:hover{filter:brightness(1.1)}
@@ -315,6 +318,7 @@ body.dragging{outline:3px dashed var(--bl);outline-offset:-6px}
   <span class="chip c-g hide-compact">&#9889; Exécution</span>
   <span class="chip c-b hide-compact">&#128196; Lecture/Écriture</span>
   <span class="chip c-o hide-compact">&#128260; Auto-correction</span>
+  <span id="colab-chip" title="État du worker GPU Colab">&#9889; Colab</span>
   <select id="modelSel" onchange="chgM(this.value)" title="Choisir le modèle IA">
     <option>chargement…</option>
   </select>
@@ -527,6 +531,17 @@ function connect(){
     }
     else if(d.type==="speed"){
       const sp=document.getElementById("speed-chip");sp.style.display="inline-block";sp.textContent=d.tps+" tok/s";
+    }
+    else if(d.type==="colab_status"){
+      const cc=document.getElementById("colab-chip");
+      if(!d.configured){cc.style.display="none";}
+      else{
+        cc.style.display="inline-block";
+        cc.className=d.up?"up":"down";
+        cc.innerHTML=d.up?"&#9889; Colab":"&#9889; Colab hors ligne";
+        cc.title=d.up?"Worker GPU Colab joignable — les taches lourdes partent sur le GPU"
+                     :"Worker GPU Colab injoignable — generation en local (relance le notebook Colab, Executer tout)";
+      }
     }
     else if(d.type==="memory"){
       const el=mk("div","mem");

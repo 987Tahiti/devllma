@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from db import init, new_session, msg, history, list_sessions, mem_search, mem_index, mem_get, mem_set, stats as db_stats, delete_session, mem_list, mem_delete, mem_purge
 from agents import AGENTS, route, OLLAMA, has_dev_keywords, is_research_question, GREETINGS, _kw_match, strip_accents, is_trivial_snippet
-from skills import SnapshotManager, Skills, safety_check, security_scan, BrainMemory, extract_files as extract_files_robust
+from skills import SnapshotManager, Skills, safety_check, security_scan, BrainMemory, extract_files as extract_files_robust, static_self_check
 try:
     from tools import read_image_text
 except Exception:
@@ -66,6 +66,36 @@ BRAIN_MEMORY = {
 # -inf : garantit l'execution du scan initial meme juste apres le boot
 # (time.monotonic() ~ uptime Windows, proche de 0 au demarrage de la machine).
 _ws_mem_ts = -1e9
+
+# Compteur global de generations en cours (toutes connexions WebSocket confondues),
+# lu par _self_watchdog() qui tourne dans un thread separe sans acces aux variables
+# locales de ws_handler. Simple int protege par le GIL (incr/decr atomiques en pratique).
+_ACTIVE_GEN = {"n": 0}
+
+# Notifications globales vers TOUTES les UI connectees (etat du worker Colab, etc.).
+# _colab_keepalive() tourne dans un thread separe : il n'a pas de WebSocket a lui, il
+# diffuse donc via _broadcast_threadsafe() en planifiant l'envoi sur _MAIN_LOOP.
+_WS_CLIENTS = set()                          # WebSocket actifs (ajoutes/retires par ws_handler)
+_MAIN_LOOP = None                            # boucle asyncio principale, capturee au 1er /ws
+_COLAB_STATE = {"up": None, "configured": False}  # dernier etat connu du worker Colab
+
+def _broadcast_threadsafe(payload):
+    """Diffuse un evenement JSON a toutes les UI connectees, depuis N'IMPORTE quel
+    thread : planifie l'envoi sur la boucle asyncio principale. Sans effet si aucune
+    UI n'est connectee ou si la boucle n'est pas encore prete."""
+    loop = _MAIN_LOOP
+    if loop is None or not _WS_CLIENTS:
+        return
+    async def _send_all():
+        for ws in list(_WS_CLIENTS):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                _WS_CLIENTS.discard(ws)
+    try:
+        asyncio.run_coroutine_threadsafe(_send_all(), loop)
+    except Exception:
+        pass
 
 def load_workspace_memory(force=False):
     """Scanne le workspace et charge la mémoire des projets existants.
@@ -181,14 +211,151 @@ RÈGLES ABSOLUES:
   imports entre ces fichiers DOIVENT etre en imports simples SANS prefixe de package et SANS point
   (ex: "from database import get_db", PAS "from app.database import get_db" ni "from .database import get_db").
   Le point d'entree est execute directement (python app/main.py), donc "app" n'est PAS un package
-  importable — seul l'import simple par nom de fichier fonctionne."""
+  importable — seul l'import simple par nom de fichier fonctionne.
+- FastAPI + SQLAlchemy -> NE JAMAIS utiliser un modele SQLAlchemy (classe heritant de Base/declarative_base)
+  directement comme response_model d'une route (ex: @app.get("/x", response_model=ModeleSQLAlchemy) ou
+  response_model=List[ModeleSQLAlchemy]) : FastAPI plante AU DEMARRAGE avec "Invalid args for response
+  field, ... is a valid Pydantic field type ?" (constate de facon repetee). TOUJOURS definir un schema
+  Pydantic SEPARE (souvent dans schemas.py) avec `class Config: orm_mode = True` (Pydantic v1) ou
+  `model_config = ConfigDict(from_attributes=True)` (Pydantic v2), et utiliser CE schema comme response_model,
+  jamais la classe SQLAlchemy elle-meme.
+- RÈGLE CRITIQUE (import manquant — bug constate a repetition, sur des fichiers differents dans des
+  projets differents) : CHAQUE fichier Python DOIT importer LUI-MEME tout ce qu'il utilise, y compris
+  la stdlib (time, io, csv, json, re, datetime, contextlib...). Ne JAMAIS supposer qu'un import present
+  dans un AUTRE fichier du meme projet est disponible ici — chaque fichier est un module independant
+  avec son propre espace de noms. Avant de finir un fichier, relis-le et verifie que chaque nom utilise
+  (fonction, classe, module) est soit defini dans ce fichier, soit importe en tete de CE fichier.
+- FastAPI + SQLAlchemy -> la fonction de dependance utilisee avec Depends() (typiquement get_db()) DOIT
+  etre un generateur SIMPLE, jamais decore par @contextmanager :
+  def get_db():
+      db = SessionLocal()
+      try:
+          yield db
+      finally:
+          db.close()
+  Depends() appelle lui-meme la fonction generatrice ; si elle est decoree @contextmanager, Depends()
+  recoit un objet gestionnaire de contexte au lieu de la session SQLAlchemy, et TOUTES les routes qui
+  en dependent echouent (constate).
+- RÈGLE CRITIQUE (collision de nom — constate a 2 reprises independantes, formes differentes, mais
+  meme cause racine) : un nom LOCAL (fonction de route FastAPI, parametre, variable) NE DOIT JAMAIS
+  porter EXACTEMENT le meme nom qu'une fonction importee que ce code appelle — le nom local ECRASE
+  l'import dans cette portee, et l'appel invoque alors le mauvais objet.
+  Cas 1 (route ecrase un import de crud.py) :
+      from crud import calculer_amende
+      @app.get("/x")
+      def calculer_amende(...):        # <- ecrase l'import au niveau module !
+          return calculer_amende(...)  # <- s'appelle ELLE-MEME -> RecursionError
+  Cas 2 (parametre/flag ecrase un import de fonction) :
+      from link_checker import check_links
+      def cli_main(check_links: bool):     # <- le PARAMETRE ecrase l'import !
+          if check_links:
+              check_links(html, path)      # <- appelle le booleen -> TypeError: 'bool' object is not callable
+  Ceci passe souvent inapercu car le reste du fichier semble normal. Avant de finir un fichier,
+  verifie qu'AUCUN nom de fonction/parametre/variable local ne reutilise le nom d'une fonction
+  importee qu'il appelle par ailleurs. Si besoin, renomme le local (ex: suffixe _route, _flag,
+  ou prefixe route_/do_) ou importe le module entier ("import crud"/"import link_checker") et
+  appelle-le via crud.xxx()/link_checker.xxx()."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
 ###FILE: nom.ext
 <code corrigé complet>
 ###ENDFILE
-Pas de texte hors des blocs."""
+Pas de texte hors des blocs.
+
+RÈGLE PRIORITAIRE : si l'erreur est un NameError ("name 'X' is not defined"), l'HYPOTHESE PAR DEFAUT
+est un import manquant en tete du fichier concerne (ex: NameError: name 'time' is not defined -> ajouter
+"import time"). Verifie et corrige CE point EN PRIORITE avant toute autre hypothese — c'est la cause la
+plus frequente constatee, et une correction qui ne fait qu'ajouter la ligne d'import manquante suffit
+generalement (pas besoin de reecrire le reste du fichier)."""
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Auto-apprentissage — DevLLMA distille ses propres echecs/corrections en
+#  regles reutilisables, indexees en memoire semantique (kind="lesson") et
+#  reinjectees dynamiquement dans CODER_SYSTEM/CODER_FIX_SYSTEM pour les
+#  PROCHAINS projets. Boucle de correction fermee : plus besoin d'un humain
+#  qui repere un bug au banc de tests et patch le prompt a la main (ce qui
+#  a ete fait manuellement ~6 fois le 14/07/2026 avant la mise en place de
+#  ce mecanisme).
+# ════════════════════════════════════════════════════════════════════════════
+LESSON_SYSTEM = """Tu es un analyste qui distille UN bug corrige en UNE regle GENERALE
+reutilisable pour des projets FUTURS et DIFFERENTS. Reponds en 1-2 phrases courtes,
+sans nommer de variables/fichiers/projets specifiques a ce cas precis — generalise le
+principe (ex: "un parametre de fonction ne doit jamais porter le meme nom qu'une
+fonction importee et appelee dans le meme corps" plutot que de citer "check_links").
+Si le bug est trop specifique a ce projet pour donner une lecon generalisable utile,
+reponds exactement: AUCUNE LECON."""
+
+def record_lesson(initial_error, fix_summary, resolved, final_error):
+    """Distille un cycle echec+correction (resolu ou non) en regle generale et l'indexe
+    (kind='lesson') pour injection future dans CODER_SYSTEM/CODER_FIX_SYSTEM. Appele en
+    fire-and-forget (run_in_executor, jamais awaite) apres la boucle d'auto-correction :
+    ne doit JAMAIS lever d'exception ni ralentir la reponse a l'utilisateur."""
+    try:
+        if resolved:
+            ctx = (f"ERREUR RENCONTREE:\n{initial_error[:800]}\n\n"
+                   f"CORRECTION QUI A RESOLU LE PROBLEME:\n{fix_summary[:800]}")
+        else:
+            ctx = (f"ERREUR RENCONTREE (JAMAIS RESOLUE apres plusieurs tentatives):\n"
+                   f"{initial_error[:800]}\n\nDERNIER ETAT (toujours en echec):\n{final_error[:500]}")
+        lesson = call_brain(ctx, system=LESSON_SYSTEM, max_tokens=220)
+        lesson = (lesson or "").strip()
+        # call_brain() ne leve JAMAIS d'exception sur panne Ollama : il renvoie une CHAINE
+        # descriptive ("(modele 'X' indisponible sur Ollama : ...)", "(brain indisponible
+        # apres 3 tentatives: ...)") qui passait tous les filtres suivants (non vide, pas le
+        # sentinel, >15 car) et etait stockee comme si c'etait une vraie lecon de code, puis
+        # reinjectee dans TOUS les projets futurs (constate en revue de code independante).
+        if lesson.startswith("(") and ("indisponible" in lesson.lower() or "erreur" in lesson.lower()):
+            return
+        # Constate empiriquement : le modele repond parfois la VRAIE lecon PUIS ajoute quand
+        # meme "AUCUNE LECON" a la suite (n'obeit pas toujours a "reponds EXACTEMENT X"). Un
+        # simple "in" aurait jete une lecon par ailleurs utile -> on ne rejette que si le
+        # sentinel est la reponse ENTIERE (une fois nettoyee), pas juste present quelque part.
+        cleaned = lesson.strip(" \n\t.\"'")
+        if not lesson or cleaned.upper() == "AUCUNE LECON" or len(lesson) < 15:
+            return
+        # Si le sentinel traine EN PLUS d'une vraie lecon, on le retire avant stockage.
+        lesson = re.sub(r'\n*AUCUNE LECON\.?\s*$', '', lesson, flags=re.IGNORECASE).strip()
+        if len(lesson) < 15:
+            return
+        # Filet de securite complementaire au sentinel : un refus PARAPHRASE (le modele
+        # n'obeit pas toujours a "reponds EXACTEMENT AUCUNE LECON") ne contient pas la
+        # chaine exacte mais reste reconnaissable a ces tournures habituelles de refus.
+        _REFUSAL_HINTS = ("trop specifique", "pas de lecon", "aucune regle generale",
+                          "ne s'applique pas", "cas particulier", "n'est pas generalisable",
+                          "pas generalisable")
+        if any(h in strip_accents(lesson.lower()) for h in _REFUSAL_HINTS):
+            return
+        # Securite anti-troncature : max_tokens coupe parfois en plein milieu d'une phrase ;
+        # on tronque a la derniere phrase complete plutot que de stocker un fragment.
+        if lesson[-1] not in ".!?":
+            last_punct = max(lesson.rfind("."), lesson.rfind("!"), lesson.rfind("?"))
+            if last_punct >= 15:
+                lesson = lesson[:last_punct + 1]
+            else:
+                return
+        # Dedup semantique : ne pas re-stocker une lecon deja tres proche d'une existante
+        # (seuil HAUT expres : on veut eviter les quasi-doublons, pas rater une nuance).
+        if mem_search(lesson, k=1, kind="lesson", min_score=0.80):
+            return
+        mem_index("lesson", lesson[:60], lesson)
+    except Exception:
+        pass  # best-effort : ne doit jamais impacter le pipeline principal
+
+def _record_lesson_tracked(initial_error, fix_summary, resolved, final_error):
+    """Wrapper qui compte cet appel dans _ACTIVE_GEN pendant toute sa duree. record_lesson
+    est lance en fire-and-forget (jamais awaite) juste avant que handle_prompt() ne
+    retourne — sans ce compteur, _ACTIVE_GEN retombe a 0 des le retour de handle_prompt
+    alors que ce thread d'arriere-plan peut encore solliciter Ollama (call_brain, jusqu'a
+    ~15 min via 3 tentatives x 300s) : le watchdog reperdrait la tolerance qui vient
+    justement d'etre ajoutee pour tolerer une generation active (constate en revue de
+    code independante — reouvrait exactement le bug de faux-redemarrage du jour meme,
+    dans un angle mort different)."""
+    _ACTIVE_GEN["n"] += 1
+    try:
+        record_lesson(initial_error, fix_summary, resolved, final_error)
+    finally:
+        _ACTIVE_GEN["n"] = max(0, _ACTIVE_GEN["n"] - 1)
 
 SHELL_SYSTEM = """Tu es SHELL. Tu génères des commandes PowerShell pour accomplir des tâches système.
 Format: ```powershell\ncommande\n```
@@ -346,6 +513,26 @@ def find_entry_point(project_dir):
                if f.endswith(".py") and os.path.isfile(os.path.join(project_dir, f))]
     if len(root_py) == 1:
         return root_py[0]
+    # Plusieurs fichiers .py mais AUCUN nom d'entree standard (constate, data_05 : le modele
+    # a produit des modules sans main.py -> projet jamais execute, run_ok=None). On identifie
+    # le point d'entree reel comme le fichier qui contient un bloc `if __name__ == "__main__"`.
+    if len(root_py) > 1:
+        entry_candidates = []
+        for f in root_py:
+            try:
+                src = open(os.path.join(project_dir, f), encoding="utf-8").read()
+            except Exception:
+                continue
+            if re.search(r'if\s+__name__\s*==\s*["\']__main__["\']', src):
+                entry_candidates.append(f)
+        # Un seul candidat -> c'est lui. Plusieurs -> on privilegie un nom "principal" courant.
+        if len(entry_candidates) == 1:
+            return entry_candidates[0]
+        if entry_candidates:
+            for pref in ("main.py", "app.py", "run.py", "cli.py", "__main__.py"):
+                if pref in entry_candidates:
+                    return pref
+            return entry_candidates[0]
     return None
 
 def _kill_process_tree(pid):
@@ -427,12 +614,39 @@ def _wait_any_port_open(ports, max_wait=12):
 
 def _http_probe(port):
     """Requete HTTP reelle sur la racine du serveur — un statut (meme 404) prouve
-    qu'une vraie appli repond, pas juste qu'un port TCP est ouvert par autre chose."""
+    qu'une vraie appli repond, pas juste qu'un port TCP est ouvert par autre chose.
+    Retourne (etat, detail) avec etat in {True, False, None} :
+      None  -> pas de reponse HTTP du tout (serveur websocket/socket brut probable,
+               PAS une erreur : purement informatif, cf. appelant).
+      True  -> HTTP confirme, et si FastAPI/openapi.json dispo, une vraie route a
+               ete testee avec succes.
+      False -> HTTP confirme MAIS une vraie route retourne une erreur serveur —
+               echec REEL, pas juste "pas de HTTP" (constate, projet "api_05":
+               "/" repond 200 alors que TOUTES les routes qui touchent la DB
+               plantent, get_db() decore par erreur avec @contextmanager,
+               incompatible avec Depends())."""
     try:
         r = requests.get(f"http://127.0.0.1:{port}/", timeout=3)
-        return True, r.status_code
+        root_status = r.status_code
     except Exception as e:
-        return False, str(e)
+        return None, str(e)
+    try:
+        o = requests.get(f"http://127.0.0.1:{port}/openapi.json", timeout=3)
+        if o.status_code == 200:
+            paths = o.json().get("paths", {})
+            for path, methods in paths.items():
+                if "{" in path or "get" not in methods:
+                    continue
+                try:
+                    rr = requests.get(f"http://127.0.0.1:{port}{path}", timeout=5)
+                except Exception as e:
+                    return False, f"route {path} injoignable: {e}"
+                if rr.status_code >= 500:
+                    return False, f"route {path} renvoie {rr.status_code} (dependance/DB probablement cassee)"
+                break  # une route GET fonctionnelle suffit a valider que get_db()/deps marchent
+    except Exception:
+        pass  # pas de FastAPI/openapi.json exploitable -> on garde le check racine seul
+    return True, root_status
 
 def execute_project(project_dir, timeout=15):
     ep = find_entry_point(project_dir)
@@ -440,13 +654,44 @@ def execute_project(project_dir, timeout=15):
         return None, "Aucun fichier principal trouvé (main.py, app.py…)", None
     fpath = os.path.join(project_dir, ep)
     is_server, server_ports = _detect_server_port(project_dir)
+    # Force les E/S du projet enfant en UTF-8 : sur Windows la console par defaut est en
+    # cp1252, et un simple print() contenant un emoji ou un caractere hors cp1252 (fleche
+    # de tendance, symbole meteo...) crashe avec UnicodeEncodeError — alors que le code est
+    # CORRECT (constate, projet meteo). PYTHONIOENCODING+PYTHONUTF8 alignent l'enfant sur
+    # l'UTF-8 (ce que fait tout deploiement moderne) et suppriment cette classe de faux echecs.
+    child_env = dict(os.environ)
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
     proc = None
     try:
         proc = subprocess.Popen([PYTHON, fpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, cwd=project_dir, encoding="utf-8", errors="replace")
+                                text=True, cwd=project_dir, encoding="utf-8", errors="replace",
+                                env=child_env)
         try:
             out, _ = proc.communicate(timeout=timeout)
             combined = (out or "").strip()[:800]
+            low = combined.lower()
+            cli_usage_exit = proc.returncode != 0 and (
+                # Signatures explicites argparse / click / typer
+                re.search(r'the following arguments are required'
+                          r"|Error:\s*Missing (?:option|argument)"
+                          r"|Missing (?:option|argument)\b", combined, re.IGNORECASE)
+                # Heuristique GENERALE : sortie d'usage CLI (argparse SystemExit(2) ou click) =
+                # une ligne "usage:" + une ligne "... error: ..." et AUCUN Traceback. Couvre les
+                # messages d'erreur PERSONNALISES via parser.error("...") (constate, data_10 :
+                # "main.py: error: Veuillez specifier --config") que les regex ci-dessus ratent.
+                # L'absence de Traceback distingue "mauvais usage CLI" (code sain) d'un vrai crash.
+                or ("traceback" not in low
+                    and re.search(r'(?m)^usage:', combined, re.IGNORECASE)
+                    and re.search(r'\berror:', combined, re.IGNORECASE))
+            )
+            if cli_usage_exit:
+                # CLI avec argument(s) obligatoire(s) : "python main.py" SANS argument echoue
+                # TOUJOURS par construction, meme quand le code est correct (constate sur argparse
+                # required=True, click/typer Missing option, ET parser.error personnalise — chaque
+                # fois 4 cycles d'auto-correction gaspilles sur du code sain, avec RISQUE de le
+                # casser). Exiger des arguments en CLI est une bonne pratique, pas un bug.
+                return True, f"(outil CLI avec arguments obligatoires — usage normal sans arguments) {combined[:200]}", ep
             return proc.returncode == 0, combined, ep
         except subprocess.TimeoutExpired:
             # Process encore vivant apres le timeout : si c'est un serveur, on VERIFIE
@@ -462,6 +707,10 @@ def execute_project(project_dir, timeout=15):
                     _kill_process_tree(proc.pid)
                     try: proc.communicate(timeout=3)
                     except Exception: pass
+                    if ok_http is False:
+                        # HTTP confirme mais une vraie route echoue -> echec REEL, pas un
+                        # simple "pas de HTTP" (serveur websocket/socket brut) a ignorer.
+                        return False, f"(serveur demarre sur le port {opened} mais {detail})", ep
                     http_note = f" — répond en HTTP {detail}" if ok_http else ""
                     return True, f"(serveur actif — écoute sur le port {opened}{http_note})", ep
                 _kill_process_tree(proc.pid)
@@ -518,8 +767,18 @@ def is_edit(prompt):
 _FILE_OR_DOC_RE = re.compile(
     r'\b(fichier|dossier|document|note|classeur|feuille excel|tableau excel|fichier word|fichier pdf|word|excel|pdf)\b')
 _STRONG_DEV_RE = re.compile(
-    r'\b(api|application|app|site|projet|programme|logiciel|jeu|bot|fonction|classe|serveur|'
-    r'backend|frontend|base de donnees|script python|interface|dashboard|tableau de bord)\b')
+    r'\b(api|application|app|site|projet|programme|logiciel|jeu|jeux|quiz|bot|fonction|classe|serveur|'
+    r'backend|frontend|base de donnees|interface|dashboard|tableau de bord|'
+    r'outil|ligne de commande|\bcli\b|'
+    r'python|javascript|typescript|\bjs\b|\bjava\b|react|vue|angular|node|flask|fastapi|django|html|css)\b')
+# Ajoute "outil"/"ligne de commande"/"cli" PUIS les noms de langage/framework + "quiz"/"jeux"
+# (constate, banc de tests, 2 categories touchees) : un projet de dev qui MANIPULE des
+# fichiers (CLI d'organisation de fichiers ; quiz qui sauvegarde les scores "en fichier")
+# matchait _FILE_OR_DOC_RE sur "fichier"/"dossier" SANS matcher l'ancienne liste ->
+# is_file_or_doc_action() le classait a tort comme "action fichier ponctuelle" et partait
+# vers l'agent generaliste au lieu du pipeline de dev. Un nom de LANGAGE (python, js...) est
+# un signal de dev en beton : "un quiz EN PYTHON qui sauvegarde les scores en fichier" doit
+# aller au pipeline. NB : "script python" retire car "python" seul le couvre desormais.
 
 def is_file_or_doc_action(prompt):
     """Vrai si la demande vise un FICHIER/DOCUMENT ponctuel (dossier, note, Word/Excel/PDF...)
@@ -537,11 +796,25 @@ _HEAVY_MEDIA_RE = re.compile(
     r'\b(gener\w*|cree\w*|creer|dessine\w*|fais|produis|fabrique\w*)\b[^.?!\n]{0,40}'
     r'\b(image|images|photo|photos|illustration|dessin|logo|visuel|banniere|avatar|'
     r'video|videos|clip|animation|rendu)\b')
+# Signal ETROIT "construire un programme" (pour desamorcer un faux positif media sur un
+# outil qui TRAITE des images) : uniquement des mots qui signifient sans ambiguite "ecris
+# du code", volontairement SANS site/app/api/interface (contexte design possible).
+_BUILD_PROGRAM_RE = re.compile(
+    r'\b(outil|script|programme|logiciel|cli|ligne de commande|'
+    r'python|javascript|typescript|node|module|package|bibliotheque|librairie)\b')
 def is_heavy_media_request(prompt):
     low = strip_accents(prompt.lower())
     # "jeu video"/"mini-jeu video"/"jeu de..." = un JEU a developper (projet), PAS une
     # generation de video : le mot "jeu" desamorce le faux positif sur "video".
     if re.search(r'\bjeu', low):
+        return False
+    # Un OUTIL/SCRIPT/programme qui MANIPULE des images (redimensionner, convertir, compresser...)
+    # est un projet de DEV, pas une demande de GENERATION d'image a deleguer au GPU (constate,
+    # banc de tests : "outil Python de redimensionnement d'images en lot" partait a tort vers
+    # l'agent de generation media). On utilise un signal "construire un programme" ETROIT (pas
+    # _STRONG_DEV_RE entier, qui contient site/app/api et capterait a tort "genere une image
+    # pour mon site").
+    if _BUILD_PROGRAM_RE.search(low):
         return False
     return bool(_HEAVY_MEDIA_RE.search(low))
 
@@ -1063,8 +1336,14 @@ MAX_PROMPT_CHARS = 40000  # ~11k tokens : genereux pour un vrai collage de code,
 # et modele different = second avis quand le local bloque. Repli local si Colab eteint.
 _COLAB_ASK_RE = re.compile(r'\b(utilise|via|avec|sur|passe par)\s+colab\b')
 
-def _colab_llm(system, prompt, timeout=600):
-    """Generation de code par le LLM GPU du worker Colab (/llm). Texte, ou None si indispo."""
+def _colab_llm(system, prompt, timeout=(10, 180)):
+    """Generation de code par le LLM GPU du worker Colab (/llm). Texte, ou None si indispo.
+    timeout=(connexion, silence-lecture) plutot qu'un flat 600s : un notebook Colab qui
+    accepte la connexion puis reste bloque (kernel plante, GPU OOM, session expiree)
+    gelait la tache jusqu'a 10 MINUTES avant le repli local (constate — l'URL ngrok
+    configuree etait perimee). Ici, 10s pour joindre le tunnel + jusqu'a 3 min de
+    silence avant d'abandonner : repli local largement plus rapide, generation
+    legitime mais lente toujours toleree tant qu'elle produit des octets."""
     base = mem_get("colab_url")
     if not base:
         return None
@@ -1178,6 +1457,17 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             f"- [{m['kind']}] {m['ref_name']}: {m['chunk'][:200]}" for m in memories)
         await websocket.send_json({"type":"memory","items":[{"ref":m["ref_name"],"score":m["score"]} for m in memories]})
 
+    # ── Lecons auto-apprises (kind="lesson", cf. record_lesson) — auto-correction :
+    # DevLLMA reinjecte ici ce qu'il a lui-meme distille de ses echecs passes, sans
+    # qu'un humain ait besoin de repatcher CODER_SYSTEM a la main a chaque bug trouve.
+    lessons = await asyncio.get_event_loop().run_in_executor(None, lambda: mem_search(prompt, 4, kind="lesson", min_score=0.35))
+    lessons_note = ""
+    if lessons:
+        lessons_note = "\n\nLECONS AUTO-APPRISES (bugs deja rencontres et corriges sur des projets similaires — EVITE-LES) :\n" + "\n".join(
+            f"- {l['chunk']}" for l in lessons)
+    coder_system_dyn = CODER_SYSTEM + lessons_note
+    coder_fix_system_dyn = CODER_FIX_SYSTEM + lessons_note
+
     # ── Contexte conversationnel : le pipeline projet suit maintenant le fil du chat
     # (avant, seul l'agent generaliste l'avait) -> "ajoute X au projet precedent",
     # "reprends l'idee d'avant" fonctionnent sans re-decrire tout le contexte.
@@ -1233,7 +1523,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         f"Produis chaque fichier au format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE\n"
         f"{consigne}"
     )
-    code_resp = await _gen_code(websocket, agent_name, enriched, CODER_SYSTEM, cancel_event,
+    code_resp = await _gen_code(websocket, agent_name, enriched, coder_system_dyn, cancel_event,
                                 via_colab=big_project)
     msg(sid, agent_name, "assistant", code_resp)
     if cancel_event.is_set():
@@ -1249,6 +1539,16 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     # ── Phase 4 : Écrire les fichiers (avec sauvegarde) ──────────────
     files = extract_files(code_resp)
     run_ok = None
+    if not files and code_resp and code_resp.strip():
+        # Constate (projet "api_04") : le codeur a repondu (souvent une reponse
+        # tronquee/incomplete) mais AUCUN fichier n'a pu en etre extrait -> jusqu'ici
+        # le pipeline se terminait en silence, sans que l'utilisateur sache que rien
+        # n'a ete ecrit. On le rend visible explicitement.
+        await websocket.send_json({
+            "type": "token",
+            "text": "\n⚠ Aucun fichier n'a pu être extrait de la réponse du codeur "
+                    "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
+        })
     if files:
         # Snapshot AVANT d'écraser un projet existant (rollback possible)
         if os.path.isdir(project_dir):
@@ -1297,7 +1597,29 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             fix_p = ("ERREUR DE SYNTAXE (py_compile):\n" + "\n".join(syntax_errs) +
                      f"\n\nCODE ACTUEL:\n{format_context(cur)}\n\n"
                      f"Corrige la syntaxe. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
-            fix_resp = await stream_agent(websocket, agent_name, fix_p, CODER_FIX_SYSTEM, cancel_event=cancel_event)
+            fix_resp = await stream_agent(websocket, agent_name, fix_p, coder_fix_system_dyn, cancel_event=cancel_event)
+            fixed = extract_files(fix_resp)
+            if fixed:
+                await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
+
+        # ── Auto-correction STATIQUE (AST, zero appel LLM) avant d'executer ──
+        # Detecte la classe de bug la plus couteuse constatee au banc de tests (collision
+        # de nom local/import appele comme fonction -> RecursionError/TypeError garanti a
+        # l'execution) SANS jamais lancer le code : economise un cycle complet
+        # install+execute+diagnostic pour un probleme deja certain avant meme de tourner.
+        static_probs = await asyncio.get_event_loop().run_in_executor(None, static_self_check, project_dir)
+        if static_probs and not cancel_event.is_set():
+            await websocket.send_json({"type":"file_created","name":"⚠ Collision de nom detectee — correction rapide","size":""})
+            cur = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+            fix_p = ("PROBLEME POTENTIEL DETECTE PAR ANALYSE STATIQUE (avant meme execution) :\n" +
+                     "\n".join(static_probs) +
+                     f"\n\nCODE ACTUEL:\n{format_context(cur)}\n\n"
+                     f"Si c'est reellement un bug (le nom local masque un import DISTINCT qui devrait "
+                     f"etre appele a la place), corrige en renommant le nom local en collision. "
+                     f"Si au contraire c'est une recursion INTENTIONNELLE sans rapport avec l'import "
+                     f"(le nom ne fait que coincider), NE CHANGE RIEN a ce fichier et renvoie-le identique. "
+                     f"Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
+            fix_resp = await stream_agent(websocket, agent_name, fix_p, coder_fix_system_dyn, cancel_event=cancel_event)
             fixed = extract_files(fix_resp)
             if fixed:
                 await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
@@ -1335,6 +1657,8 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             if not run_ok:
                 prev_err = None
                 stuck = 0
+                initial_error = run_out
+                last_fix_summary = ""
                 for iteration in range(1, 4):
                     if cancel_event.is_set():
                         break
@@ -1382,7 +1706,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                              f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
                              f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
                     # Bloqué (escalate) OU deja en mode Colab -> on delegue la correction au GPU.
-                    fix_resp = await _gen_code(websocket, agent_name, fix_p, CODER_FIX_SYSTEM,
+                    fix_resp = await _gen_code(websocket, agent_name, fix_p, coder_fix_system_dyn,
                                                cancel_event, temperature=fix_temp,
                                                via_colab=(escalate or big_project))
                     if cancel_event.is_set():
@@ -1400,12 +1724,19 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         applied.append((fname, code))
                     if applied:
                         await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, applied)
+                        last_fix_summary = "\n".join(f"### {fname}\n{code[:600]}" for fname, code in applied)
 
                     run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
                         None, execute_project, project_dir
                     )
                     await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
                     if run_ok: break
+
+                # Auto-apprentissage (fire-and-forget, jamais awaite : ne doit pas retarder
+                # la reponse). Distille ce cycle echec+correction en une regle generale et
+                # l'indexe pour les PROCHAINS projets (cf. record_lesson plus haut).
+                asyncio.get_event_loop().run_in_executor(
+                    None, _record_lesson_tracked, initial_error, last_fix_summary, run_ok, run_out)
 
         # Commit git automatique d'une version qui marche (point de restauration)
         if run_ok:
@@ -1432,6 +1763,17 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
 @app.websocket("/ws")
 async def ws_handler(websocket: WebSocket):
     await websocket.accept()
+    global _MAIN_LOOP
+    if _MAIN_LOOP is None:                 # capture la boucle pour les notifs venues d'un thread
+        _MAIN_LOOP = asyncio.get_running_loop()
+    _WS_CLIENTS.add(websocket)
+    # Pousse l'etat Colab connu tout de suite -> l'UI affiche le bon indicateur des
+    # l'ouverture, sans attendre la prochaine transition detectee par _colab_keepalive.
+    try:
+        await websocket.send_json({"type": "colab_status",
+                                   "configured": _COLAB_STATE["configured"], "up": _COLAB_STATE["up"]})
+    except Exception:
+        pass
     sid_box = {"sid": new_session("Web Session")}   # une session par connexion
     queue = asyncio.Queue()
     cancel_event = asyncio.Event()
@@ -1442,6 +1784,7 @@ async def ws_handler(websocket: WebSocket):
         while True:
             prompt = await queue.get()
             busy["v"] = True
+            _ACTIVE_GEN["n"] += 1
             cancel_event.clear()
             try:
                 await handle_prompt(websocket, sid_box, prompt, cancel_event)
@@ -1451,6 +1794,8 @@ async def ws_handler(websocket: WebSocket):
                     await websocket.send_json({"type":"done"})
                 except Exception:
                     pass
+            finally:
+                _ACTIVE_GEN["n"] = max(0, _ACTIVE_GEN["n"] - 1)
             busy["v"] = False
             queue.task_done()
 
@@ -1543,6 +1888,8 @@ async def ws_handler(websocket: WebSocket):
         # bloque l'unique slot de generation CPU pour la session suivante.
         cancel_event.set()
         worker_task.cancel()
+    finally:
+        _WS_CLIENTS.discard(websocket)  # ne plus lui diffuser de notifications
 
 def _startup_warmup():
     """Precharge le modele PUIS le cache KV du prefixe de l'agent (systeme+outils).
@@ -1564,16 +1911,30 @@ def _self_watchdog():
     pendant plusieurs minutes — le redemarrage automatique deja configure sur la
     tache planifiee (RestartCount=3, RestartInterval=1 min) reprend alors la main.
     Ne tue jamais rien d'autre que soi-meme : ne devrait pas etre vu comme un outil
-    de persistance/attaque."""
+    de persistance/attaque.
+
+    CORRECTIF (14/07/2026, banc de 60 tests Colab) : ce watchdog confondait "CPU
+    sature par une generation locale longue" (event loop asyncio qui met plusieurs
+    secondes a repondre a une requete HTTP concurrente, sur ce poste 100% CPU, sans
+    GPU) et "serveur mort". Un test qui a bascule en fallback local pendant ~3 min a
+    coincide exactement avec un redemarrage force du process en plein milieu de sa
+    generation. On consulte maintenant _ACTIVE_GEN : si une generation est en cours,
+    un echec HTTP n'est PAS compte comme un vrai echec (juste "lent, pas mort") et on
+    utilise un timeout de requete plus genereux."""
     time.sleep(60)  # laisse le temps au demarrage normal (bind du port quasi instantane,
                      # mais on evite tout faux positif pendant les tout premiers instants)
     fails = 0
     while True:
+        gen_busy = _ACTIVE_GEN["n"] > 0
         try:
-            r = requests.get("http://127.0.0.1:8080/", timeout=10)
+            r = requests.get("http://127.0.0.1:8080/", timeout=(30 if gen_busy else 10))
             fails = 0 if r.status_code == 200 else fails + 1
         except Exception:
-            fails += 1
+            if gen_busy:
+                print("[AUTO-SURVEILLANCE] serveur lent a repondre pendant une generation "
+                      "active (CPU sature) -> pas compte comme un echec", flush=True)
+            else:
+                fails += 1
         if fails:
             print(f"[AUTO-SURVEILLANCE] serveur local injoignable ({fails}/3)", flush=True)
         if fails >= 3:
@@ -1582,10 +1943,53 @@ def _self_watchdog():
             os._exit(1)
         time.sleep(90)
 
+def _colab_keepalive():
+    """Garde le worker Colab chaud et SURVEILLE son etat, tant qu'une URL est
+    configuree (mem_get('colab_url')).
+
+    Ce que ca fait / ne fait PAS :
+      - Ping /toutes les ~3 min -> garde le tunnel ngrok et le serveur uvicorn
+        reactifs (pas de reveil a froid sur la 1re vraie generation), et donne a
+        DevLLMA une connaissance LIVE de l'etat du worker (up/down).
+      - Ca ne remet PAS a zero le minuteur d'inactivite de Colab (celui-ci est cote
+        FRONTEND) : le vrai anti-deconnexion ~90 min est la cellule heartbeat au
+        premier plan + l'auto-clic navigateur (cf. Colab-Worker.md). Ici on se
+        contente de tracer les transitions pour que l'utilisateur sache quand
+        re-executer le notebook -- le repli local automatique (_gen_code) prend le
+        relais entre-temps.
+
+    Purement sortant vers une URL que l'utilisateur a lui-meme configuree ; ne tue
+    et ne redemarre rien."""
+    headers = {"ngrok-skip-browser-warning": "1"}
+    last = None  # dernier etat diffuse : None (jamais) / (configured, up)
+    time.sleep(45)
+    while True:
+        base = mem_get("colab_url")
+        if not base:
+            state = (False, None)          # worker non configure : rien a surveiller
+        else:
+            try:
+                r = _http.get(base + "/", headers=headers, timeout=(5, 10))
+                state = (True, r.status_code == 200)
+            except Exception:
+                state = (True, False)
+        if state != last:
+            configured, up = state
+            if configured and up:
+                print("[COLAB] worker JOIGNABLE (tunnel chaud, GPU dispo)", flush=True)
+            elif configured and last is not None:
+                print("[COLAB] worker INJOIGNABLE -> repli local actif. "
+                      "Re-execute le notebook Colab (Executer tout) pour le relancer.", flush=True)
+            _COLAB_STATE["configured"], _COLAB_STATE["up"] = configured, up
+            _broadcast_threadsafe({"type": "colab_status", "configured": configured, "up": up})
+            last = state
+        time.sleep(180)
+
 if __name__ == "__main__":
     import threading
     threading.Thread(target=_startup_warmup, daemon=True).start()
     threading.Thread(target=_self_watchdog, daemon=True).start()
+    threading.Thread(target=_colab_keepalive, daemon=True).start()
     # host="0.0.0.0" est INTENTIONNEL, pas un oubli : c'est ce qui permet l'acces
     # LAN (192.168.1.30) et Tailscale (100.112.22.79, PWA mobile) mis en place
     # deliberement. Le repasser en 127.0.0.1 casserait l'acces telephone/tablette.

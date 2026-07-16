@@ -135,8 +135,66 @@ def llm(body: dict = Body(...), authorization: str = Header(default="")):
 print("Endpoint /llm prêt (relance la cellule 3 si tu l'avais deja lancee).")
 ```
 
+---
+
+## Garder la session ACTIVE (anti-déconnexion) — À LIRE
+
+Colab coupe le worker pour **deux raisons différentes** — ne pas les confondre :
+
+| Cause | Délai | Solution |
+|---|---|---|
+| **Inactivité** : la cellule 3 *se termine*, donc plus aucune cellule ne « tourne » → Colab te croit oisif (le thread `uvicorn` daemon ne compte pas). | ~90 min | Cellule 6 + auto-clic navigateur (ci-dessous) |
+| **Limite absolue** de session sur le tier gratuit. | ~12 h | ❌ Rien (voir « Limite dure » plus bas) |
+
+### Cellule 6 — HEARTBEAT (à exécuter en DERNIER, laisse-la tourner)
+> C'est **la** cellule qui empêche la coupure des ~90 min. Elle ne se termine **jamais** :
+> tant qu'elle tourne, Colab considère le runtime comme **actif**. Lance-la après la cellule 3.
+> Version prête à coller (avec l'auto-clic navigateur en commentaire) : **`Colab-Cellule-Heartbeat.py`**.
+```python
+# NE S'ARRETE JAMAIS : garde le runtime "occupe" (pas d'oisivete) + garde le GPU alloue.
+import time, datetime, torch
+n = 0
+while True:
+    n += 1
+    try:
+        # micro-calcul GPU : prouve l'activite ET garde la VRAM/le modele au chaud
+        _ = (torch.randn(512, 512, device="cuda") @ torch.randn(512, 512, device="cuda")).sum().item()
+        gpu = "GPU ok"
+    except Exception as e:
+        gpu = f"GPU KO: {e}"
+    print(f"[{datetime.datetime.now():%H:%M:%S}] worker vivant — heartbeat #{n} ({gpu})", flush=True)
+    time.sleep(60)
+```
+
+### Auto-clic navigateur (déjoue le « êtes-vous toujours là ? »)
+Même avec la cellule 6, Colab affiche parfois une invite anti-bot après un long moment sans
+interaction. Ouvre la console développeur (**F12** → onglet *Console*), colle ceci, Entrée :
+```javascript
+// Reclique le bouton "Connect/Reconnect" toutes les 60 s. Laisse l'onglet ouvert.
+function _kaColab() {
+  const sels = ['colab-connect-button', '#connect', '#comments > span'];
+  for (const s of sels) {
+    const el = document.querySelector(s);
+    if (el) { (el.shadowRoot?.querySelector('#connect') || el).click(); }
+  }
+  console.log('[keep-alive Colab]', new Date().toLocaleTimeString());
+}
+setInterval(_kaColab, 60000);
+```
+
+### Limite dure (~12 h, tier gratuit) — pas de contournement
+La cellule 6 + l'auto-clic éliminent la coupure d'inactivité, **pas** le plafond absolu de
+session du tier gratuit (~12 h, et le quota GPU varie selon l'usage). Quand ça arrive :
+- DevLLMA le détecte automatiquement (thread `_colab_keepalive` → log `[COLAB] worker INJOIGNABLE`)
+  et **bascule seul en génération locale** — rien ne casse, c'est juste plus lent.
+- Il te suffit de rouvrir le notebook et **Exécuter tout** : l'URL/token ne changent pas.
+- Pour du vraiment persistant (24 h, exécution en arrière-plan) → **Colab Pro/Pro+**.
+
+---
+
 ## Utilisation quotidienne (après config)
-1. Ouvre le notebook, **Exécuter tout** (cellules 1→3). Attends « WORKER PRET ».
-2. Dans DevLLMA : *« génère une image d'un chat astronaute »* → c'est tout. ✅
-3. Quand Colab se déconnecte (~90 min d'inactivité) : re-**Exécuter tout**. L'URL et le token
-   ne changent pas → rien à reconfigurer côté DevLLMA.
+1. Ouvre le notebook, **Exécuter tout** (cellules 1→3, puis 6). Attends « WORKER PRET ».
+2. **F12 → Console** → colle l'auto-clic ci-dessus (une fois par onglet ouvert).
+3. Dans DevLLMA : *« génère une image d'un chat astronaute »* → c'est tout. ✅
+4. Le log DevLLMA affiche `[COLAB] worker JOIGNABLE`. S'il passe à `INJOIGNABLE` (limite 12 h
+   atteinte), re-**Exécuter tout** → rien à reconfigurer côté DevLLMA.
