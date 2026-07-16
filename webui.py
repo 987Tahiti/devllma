@@ -1387,41 +1387,61 @@ MAX_PROMPT_CHARS = 40000  # ~11k tokens : genereux pour un vrai collage de code,
 _COLAB_ASK_RE = re.compile(r'\b(utilise|via|avec|sur|passe par)\s+colab\b')
 
 def _colab_llm(system, prompt, timeout=(10, 180)):
-    """Generation de code par le LLM GPU du worker Colab (/llm). Texte, ou None si indispo.
-    timeout=(connexion, silence-lecture) plutot qu'un flat 600s : un notebook Colab qui
-    accepte la connexion puis reste bloque (kernel plante, GPU OOM, session expiree)
-    gelait la tache jusqu'a 10 MINUTES avant le repli local (constate — l'URL ngrok
-    configuree etait perimee). Ici, 10s pour joindre le tunnel + jusqu'a 3 min de
-    silence avant d'abandonner : repli local largement plus rapide, generation
-    legitime mais lente toujours toleree tant qu'elle produit des octets."""
+    """Generation de code par le LLM GPU du worker Colab (/llm).
+    Retourne (texte, motif) : texte=None si indisponible, motif = raison lisible du repli
+    ('worker injoignable', 'route /llm absente (worker sans cellule LLM)', 'token invalide',
+    'erreur HTTP N', 'reponse vide') pour afficher un statut Colab HONNETE a l'utilisateur.
+    timeout=(connexion, silence-lecture) : 10s pour joindre le tunnel + jusqu'a 3 min de
+    silence avant repli local (un notebook qui accepte la connexion puis bloque gelait la
+    tache jusqu'a 10 min avant)."""
     base = mem_get("colab_url")
     if not base:
-        return None
+        return None, "aucun worker Colab configure"
     # ngrok-skip-browser-warning : evite la page d'avertissement HTML de ngrok gratuit.
     headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
     tok = mem_get("colab_token")
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
-    try:
-        r = _http.post(base + "/llm", headers=headers,
-                       json={"system": system or "", "prompt": prompt}, timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return (r.json().get("response") or "").strip() or None
-    except Exception:
-        return None
+    # 1 re-essai sur erreur de CONNEXION uniquement (blip transitoire du tunnel ngrok /
+    # reconnexion en cours) — PAS sur 404/401/500 (definitifs, inutile d'insister). Rend la
+    # delegation resiliente a une micro-coupure pendant un gros traitement.
+    last_exc = None
+    for attempt in range(2):
+        try:
+            r = _http.post(base + "/llm", headers=headers,
+                           json={"system": system or "", "prompt": prompt}, timeout=timeout)
+            if r.status_code == 404:
+                return None, "route /llm absente du worker (cellule LLM non lancee)"
+            if r.status_code == 401:
+                return None, "token Colab invalide"
+            if r.status_code != 200:
+                return None, f"erreur HTTP {r.status_code}"
+            txt = (r.json().get("response") or "").strip()
+            return (txt, None) if txt else (None, "reponse vide du worker")
+        except Exception as e:
+            last_exc = e
+            if attempt == 0:
+                time.sleep(3)  # laisse le tunnel se reconnecter avant le 2e essai
+    return None, f"worker injoignable ({type(last_exc).__name__})"
 
 async def _gen_code(websocket, agent_name, prompt, system, cancel_event, temperature=0.2, via_colab=False):
     """Genere du code via le GPU Colab si via_colab ET Colab dispo, sinon via le modele local
     (stream). Renvoie le texte complet. Repli local automatique si Colab ne repond pas."""
     if via_colab and mem_get("colab_url"):
         await websocket.send_json({"type":"agent_start","agent":"colab-gpu"})
-        await websocket.send_json({"type":"token","text":"⚡ délégué au GPU Colab...\n"})
-        txt = await asyncio.get_event_loop().run_in_executor(None, _colab_llm, system, prompt)
+        # Statut CLAIR et VERIFIABLE : on annonce une TENTATIVE (pas un succes premature),
+        # puis on confirme reellement selon le resultat. L'evenement colab_task permet a
+        # l'UI d'afficher un bandeau distinct ; le token reste visible dans le fil.
+        await websocket.send_json({"type":"colab_task","state":"start"})
+        await websocket.send_json({"type":"token","text":"⚡ Gros projet → envoi au GPU Colab (Tesla T4)…\n"})
+        txt, motif = await asyncio.get_event_loop().run_in_executor(None, _colab_llm, system, prompt)
         if txt is not None:
+            await websocket.send_json({"type":"colab_task","state":"ok"})
+            await websocket.send_json({"type":"token","text":"✅ Code généré par le GPU Colab.\n"})
             await websocket.send_json({"type":"token","text":txt})
             return txt
-        await websocket.send_json({"type":"token","text":"(GPU Colab indisponible — je continue en local)\n"})
+        await websocket.send_json({"type":"colab_task","state":"fallback","reason":motif})
+        await websocket.send_json({"type":"token","text":f"⚠️ GPU Colab non utilisé ({motif}) → génération en local (CPU).\n"})
     return await stream_agent(websocket, agent_name, prompt, system, cancel_event=cancel_event, temperature=temperature)
 
 async def handle_prompt(websocket, sid_box, prompt, cancel_event):
@@ -1548,7 +1568,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     big_project = use_colab_code or len(todos) >= 5 or len(plan) > 1500
     if big_project and mem_get("colab_url"):
         await websocket.send_json({"type":"file_created",
-            "name":"⚡ gros projet — génération déléguée au GPU Colab","size":""})
+            "name":"⚡ Gros projet détecté — tentative GPU Colab (statut confirmé ci-dessous)","size":""})
 
     # ── Phase 2 : Lire le code existant si c'est une modif/reprise ───
     existing = {}
@@ -2090,7 +2110,10 @@ def _colab_keepalive():
             _COLAB_STATE["configured"], _COLAB_STATE["up"] = configured, up
             _broadcast_threadsafe({"type": "colab_status", "configured": configured, "up": up})
             last = state
-        time.sleep(180)
+        # 60s (au lieu de 180) : garde le tunnel ngrok / uvicorn plus chauds et detecte une
+        # coupure plus vite (bandeau UI + repli local a jour). Le vrai anti-idle reste la
+        # cellule keep-alive auto-reparante cote notebook (Colab-Cellule-Heartbeat.py).
+        time.sleep(60)
 
 if __name__ == "__main__":
     import threading
