@@ -204,6 +204,12 @@ body.light .bbl pre{background:#f6f8fa}
 .blocked-r{color:var(--tx);font-family:monospace;font-size:.71rem;padding:1px 0}
 /* Typing */
 #typing{align-self:flex-start}
+#genstatus{display:none;align-items:center;gap:9px;margin:0 4px 6px;padding:7px 12px;background:var(--sf);border:1px solid var(--bd);border-left:3px solid var(--gn);border-radius:8px;font-family:monospace;font-size:.72rem;color:var(--tx)}
+#genstatus.on{display:flex}
+#genstatus .gspin{width:12px;height:12px;border:2px solid var(--bd);border-top-color:var(--gn);border-radius:50%;animation:gsp .8s linear infinite;flex-shrink:0}
+#genstatus .gph{flex:1;color:var(--tx)}
+#genstatus .gel{color:var(--mu);font-weight:700}
+@keyframes gsp{to{transform:rotate(360deg)}}
 .dots{display:flex;gap:4px;padding:10px 13px;background:var(--sf);border:1px solid var(--bd);border-radius:10px;border-bottom-left-radius:3px}
 .dots span{width:5px;height:5px;border-radius:50%;background:var(--mu);animation:bl 1.2s infinite}
 .dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
@@ -354,6 +360,7 @@ body.dragging{outline:3px dashed var(--bl);outline-offset:-6px}
       </div>
     </div>
     <div id="attach-bar"></div>
+    <div id="genstatus"></div>
     <footer style="position:relative">
       <div id="slashMenu"></div>
       <input type="file" id="imgInput" accept=".png,.jpg,.jpeg,.webp,.bmp,.docx,.xlsx,.pdf,image/*" style="display:none" onchange="handleFile(this.files[0]);this.value=''">
@@ -525,6 +532,7 @@ function connect(){
     if(d.type==="token"){curR+=d.text;if(curB)curB.innerHTML=fmt(curR);sc();}
     else if(d.type==="agent_start"){
       rmT();const c=AC[d.agent]||"#8b949e";setGenerating(true);
+      setPhase(d.agent==="brain"?"Le cerveau planifie":d.agent==="colab-gpu"?"Génération sur GPU Colab":"L'agent "+d.agent+" travaille");
       curW=mk("div","msg agent");
       curW.innerHTML='<div class="atag" style="background:'+c+'22;color:'+c+'">&#9679; '+d.agent+'</div><div class="bbl"></div><div class="msg-time">'+nowStr()+'</div>';
       chat.appendChild(curW);curB=curW.querySelector(".bbl");curR="";sc();
@@ -548,9 +556,14 @@ function connect(){
       el.innerHTML='&#129504; <b>Memoire</b>'+d.items.map(m=>'<span class="mitem">'+esc(m.ref)+' ('+m.score+')</span>').join("");
       (curW||chat).appendChild(el);sc();
     }
+    else if(d.type==="colab_task"){
+      if(d.state==="start")setPhase("⚡ Envoi au GPU Colab");
+      else if(d.state==="ok")setPhase("✅ Reçu du GPU Colab");
+      else if(d.state==="fallback")setPhase("Génération locale (Colab indispo)");
+    }
     else if(d.type==="tool_step"){
       if(d.phase==="start"){
-        rmT();
+        rmT();setPhase(d.label||"Outil en cours");
         const el=mk("div","tstep");el.dataset.stepId=d.id;
         el.innerHTML='<div class="tst-head"><div class="tspin"></div><span class="tst-label">'+esc(d.label)+'</span>'
           +'<span class="tst-arg">'+esc(d.args_preview||"")+'</span><span class="tst-status"></span></div>'
@@ -630,6 +643,7 @@ function connect(){
       todos=todos.map((t,i)=>i===d.index?{...t,done:true}:t);renderTodos();
     }
     else if(d.type==="file_created"){
+      setPhase("Écriture des fichiers");
       const e2=mk("div","fcard");
       e2.innerHTML='<span>&#128196;</span><span class="fn">'+esc(d.name)+'</span><span class="fi">'+esc(d.size)+'</span>'
         +(d.path?'<button class="fbtn" onclick="openFilePreview(\''+esc(d.path).replace(/'/g,"\\'")+'\')">Aper&#231;u</button>'
@@ -643,11 +657,13 @@ function connect(){
       addProj(d.project_name,d.path);sc();
     }
     else if(d.type==="run_result"){
+      setPhase("Vérification / exécution");
       const ok=d.ok,el=mk("div",ok?"run-ok":"run-err");
       el.innerHTML='<div class="run-label">'+(ok?"&#9654; Exécuté — OK":"&#9888; Erreur d\'exécution")+(d.entry?" ("+esc(d.entry)+")":"")+'</div><div class="run-out">'+esc(d.output||"(aucune sortie)")+'</div>';
       (curW||chat).appendChild(el);sc();
     }
     else if(d.type==="iter_start"){
+      setPhase("Auto-correction #"+d.n);
       const it=mk("div","iter");
       it.textContent="&#128260; Auto-correction — tentative "+d.n+"/3";
       (curW||chat).appendChild(it);sc();
@@ -701,7 +717,7 @@ function connect(){
       });
       loadSessions();sc();
     }
-    else if(d.type==="thinking"){addT();}
+    else if(d.type==="thinking"){addT();setGenerating(true);setPhase("Réflexion / planification");}
   };
   ws.onclose=()=>setTimeout(connect,1500);
 }
@@ -832,10 +848,33 @@ function send(){
 }
 function chgM(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"model",model:m}));}
 let generating=false;
+// ── Indicateur "traitement en cours" avec temps ecoule (cote client, tick 1s) ──
+// Donne un vrai retour d'attente meme pendant une operation longue et SILENCIEUSE
+// (generation d'image, planification du cerveau, execution) ou le serveur n'envoie
+// rien pendant plusieurs secondes/minutes. Pas de vrai %, mais un chrono qui monte.
+let _genTimer=null,_genT0=0,_genPhase="Traitement en cours";
+function _renderGen(){
+  const g=document.getElementById("genstatus");if(!g)return;
+  const s=Math.round((Date.now()-_genT0)/1000);
+  const t=s>=60?Math.floor(s/60)+" min "+(s%60)+"s":s+"s";
+  g.innerHTML='<div class="gspin"></div><span class="gph">'+esc(_genPhase)+'…</span><span class="gel">'+t+'</span>';
+}
+function startGen(){
+  const g=document.getElementById("genstatus");if(!g)return;
+  _genT0=Date.now();_genPhase="Traitement en cours";g.classList.add("on");_renderGen();
+  if(_genTimer)clearInterval(_genTimer);
+  _genTimer=setInterval(_renderGen,1000);
+}
+function stopGen2(){
+  if(_genTimer){clearInterval(_genTimer);_genTimer=null;}
+  const g=document.getElementById("genstatus");if(g){g.classList.remove("on");g.innerHTML="";}
+}
+function setPhase(txt){_genPhase=txt||_genPhase;if(_genTimer)_renderGen();}
 function setGenerating(v){
   generating=v;
   document.getElementById("stopBtn").style.display=v?"inline-block":"none";
   if(!v)document.getElementById("speed-chip").style.display="none";
+  if(v){if(!_genTimer)startGen();}else{stopGen2();}
 }
 function stopGen(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"stop"}));}
 function regenLast(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"regenerate"}));}
