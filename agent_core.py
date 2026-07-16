@@ -958,36 +958,70 @@ def _hf_params_for(model, params):
         p["negative_prompt"] = params.get("negative_prompt") or _IMG_NEGATIVE
     return p
 
+# Providers Hugging Face "Inference Providers" a essayer, dans l'ordre, pour un modele donne.
+# L'ancien provider serverless "hf-inference" a ete DEPRECIE pour les modeles image (renvoie
+# desormais HTTP 410 "model deprecated" — constate 16/07/2026) ; on passe par la route
+# OpenAI-compatible /{provider}/v1/images/generations. "together" sert FLUX.1-schnell/dev
+# (verifie fonctionnel avec la cle de ce poste). On tente plusieurs providers/modeles : le
+# 1er qui renvoie une image gagne.
+_HF_IMAGE_ROUTES = [
+    ("together", "black-forest-labs/FLUX.1-schnell"),
+    ("together", "black-forest-labs/FLUX.1-dev"),
+    ("fal-ai",   "black-forest-labs/FLUX.1-schnell"),
+    ("nebius",   "black-forest-labs/FLUX.1-dev"),
+]
+
 def _hf_image_backend(prompt, params):
-    """Image via Hugging Face Inference Providers (routeur actuel ; l'ancien
-    api-inference.huggingface.co est retire). Gratuit avec credits limites.
-    -> (bytes, ext) ou None.
-    QUALITE D'ABORD : on tente une liste de modeles dans l'ordre et le 1er qui repond
-    gagne. Defaut = FLUX.1-dev (bien plus detaille que schnell) -> repli SDXL (qui, lui,
-    exploite le prompt negatif contre les mains ratees) -> repli FLUX.1-schnell (rapide,
-    garanti dispo, comportement historique). Un modele force via hf_image_model court-
-    circuite la liste."""
+    """Image via Hugging Face Inference Providers (route OpenAI-compatible actuelle).
+    -> (bytes, ext) ou None. Essaie plusieurs providers/modeles ; 1er succes gagne.
+    Un couple force via mem 'hf_image_provider' + 'hf_image_model' court-circuite la liste."""
+    import base64 as _b64
     key = mem_get("hf_token")
     if not key:
         return None
-    configured = mem_get("hf_image_model")
-    models = [configured] if configured else [
-        "black-forest-labs/FLUX.1-dev",
-        "stabilityai/stable-diffusion-xl-base-1.0",
-        "black-forest-labs/FLUX.1-schnell",
-    ]
-    for model in models:
-        payload = {"inputs": prompt, "parameters": _hf_params_for(model, params)}
+    prov = mem_get("hf_image_provider"); mdl = mem_get("hf_image_model")
+    routes = [(prov, mdl)] if (prov and mdl) else _HF_IMAGE_ROUTES
+    size = f"{int(params.get('width', 1024))}x{int(params.get('height', 1024))}"
+    for provider, model in routes:
+        body = {"model": model, "prompt": prompt, "response_format": "b64_json", "size": size}
+        # FLUX est distille sans guidage negatif -> on n'envoie negative_prompt qu'aux modeles
+        # non-FLUX (SDXL...) qui savent l'exploiter.
+        if params.get("negative_prompt") and "flux" not in model.lower():
+            body["negative_prompt"] = params["negative_prompt"]
         try:
-            r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
-                           headers={"Authorization": f"Bearer {key}", "Accept": "image/png"},
-                           json=payload, timeout=180)
+            r = _http.post(f"https://router.huggingface.co/{provider}/v1/images/generations",
+                           headers={"Authorization": f"Bearer {key}"}, json=body, timeout=180)
         except requests.RequestException:
-            continue  # modele suivant
-        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-            return r.content, "png"
-        # 402 (credits), 401 (cle), 403 (modele gated non accepte), 404, 503 (chargement)
-        # -> on tente le modele suivant de la liste plutot que d'echouer tout de suite.
+            continue  # provider suivant
+        if r.status_code != 200:
+            continue  # 400 (modele non servi par ce provider), 402 (credits), 410... -> suivant
+        try:
+            data = r.json().get("data") or []
+            b64 = data[0].get("b64_json") if data else None
+            if b64:
+                return _b64.b64decode(b64), "png"
+        except Exception:
+            continue
+    return None
+
+def _hf_video_backend(prompt, params):
+    """Video via Hugging Face Inference (text-to-video). Best-effort : honore 'si Colab
+    bloque -> essaie HF' meme pour la video. Le tier serverless gratuit reussit RAREMENT la
+    video (souvent 503 modele non charge / 404 / PRO requis) -> renvoie None si indispo, et
+    on bascule alors sur Colab. -> (bytes, ext) ou None."""
+    key = mem_get("hf_token")
+    if not key:
+        return None
+    model = mem_get("hf_video_model") or "ali-vilab/text-to-video-ms-1.7b"
+    try:
+        r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
+                       headers={"Authorization": f"Bearer {key}"},
+                       json={"inputs": prompt}, timeout=180)
+    except requests.RequestException:
+        return None
+    ct = r.headers.get("content-type", "")
+    if r.status_code == 200 and ("video" in ct or "gif" in ct or "mp4" in ct):
+        return r.content, ("gif" if "gif" in ct else "mp4")
     return None
 
 def _colab_backend(task, prompt, params):
@@ -1041,12 +1075,17 @@ def _tool_generate_media(args):
     if task == "image" and "negative_prompt" not in params:
         params["negative_prompt"] = _IMG_NEGATIVE
     data = ext = backend = None
-    # 1) API hebergee (toujours dispo) — image via HF gratuit
+    # 1) API HÉBERGÉE (Hugging Face) EN PRIORITÉ — image ET video. HF ne depend PAS de Colab,
+    #    donc si Colab est bloque/eteint, on passe naturellement par HF (demande utilisateur).
     if task == "image":
         res = _hf_image_backend(prompt, params)
         if res:
             data, ext, backend = res[0], res[1], "Hugging Face"
-    # 2) repli GPU Colab (image + video)
+    elif task == "video":
+        res = _hf_video_backend(prompt, params)
+        if res:
+            data, ext, backend = res[0], res[1], "Hugging Face"
+    # 2) repli GPU Colab (image + video) si HF n'a pas abouti
     if data is None:
         res = _colab_backend(task, prompt, params)
         if res:
@@ -1055,8 +1094,13 @@ def _tool_generate_media(args):
         if not mem_get("hf_token") and not mem_get("colab_url"):
             return {"error": "aucun backend media configure : demande a l'utilisateur une cle Hugging Face "
                              "(hf_token='hf_...') pour la voie hebergee gratuite, ou l'URL d'un worker Colab."}
-        return {"error": f"generation {task} impossible (cle invalide, quota atteint, modele en chargement, "
-                         "ou worker Colab eteint). Pour la video, HF gratuit ne suffit pas -> worker Colab requis."}
+        if task == "video":
+            return {"error": "generation video impossible : Hugging Face gratuit ne sert pas la video de "
+                             "facon fiable (modele non charge/PRO requis) ET le worker GPU Colab est "
+                             "injoignable. Relance le notebook Colab (worker GPU) pour generer des videos. "
+                             "Les IMAGES, elles, fonctionnent via Hugging Face sans Colab."}
+        return {"error": "generation image impossible (cle HF invalide/quota, modele en chargement, "
+                         "et worker Colab injoignable). Reessaie dans 1 min ou verifie la cle Hugging Face."}
     out_dir = os.path.join(WORKSPACE_DIR, "media_out")
     os.makedirs(out_dir, exist_ok=True)
     stem = re.sub(r'[^\w]+', '_', prompt.lower())[:40].strip('_') or task
@@ -1187,6 +1231,28 @@ def _chat_call(messages, tools=None, temperature=0.3):
     return {"role": "assistant", "content": f"(agent indisponible après 3 tentatives : {last_err})"}
 
 
+# qwen3-coder EMET PARFOIS ses appels d'outils en TEXTE au lieu du format tool_calls natif
+# d'Ollama, p.ex. :
+#     <function=generate_media>
+#     <parameter=task>video</parameter>
+#     <parameter=prompt>...</parameter>
+#     </function>
+# Ollama ne parse PAS ce format -> message.tool_calls est vide, l'agent croit avoir fini et
+# l'outil n'est JAMAIS execute (l'agent "parle" de l'action sans la faire = "il ne bouge pas",
+# constate en prod sur une demande video). On reconnait ce format et on reconstruit des
+# tool_calls exploitables.
+_TEXT_FUNC_RE = re.compile(r'<function\s*=\s*([A-Za-z0-9_]+)\s*>(.*?)(?:</function>|\Z)', re.DOTALL)
+_TEXT_PARAM_RE = re.compile(r'<parameter\s*=\s*([A-Za-z0-9_]+)\s*>(.*?)</parameter>', re.DOTALL)
+
+def _parse_text_tool_calls(content):
+    calls = []
+    for fm in _TEXT_FUNC_RE.finditer(content or ""):
+        name = fm.group(1)
+        args = {k: v.strip() for k, v in _TEXT_PARAM_RE.findall(fm.group(2))}
+        calls.append({"function": {"name": name, "arguments": args}})
+    return calls
+
+
 def run_agent_sync(prompt, history_text="", notify=None, should_stop=None):
     """Boucle ReAct synchrone (a lancer dans un thread/executor — appels HTTP bloquants).
     `notify(kind, payload)` est appelee a chaque etape pour remonter la progression
@@ -1235,9 +1301,15 @@ def run_agent_sync(prompt, history_text="", notify=None, should_stop=None):
         message = _chat_call(messages, tools=TOOLS)
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            final_text = message.get("content", "").strip() or "(pas de réponse)"
-            _notify("final", final_text)
-            return final_text
+            # Repli : le modele a peut-etre emis l'appel d'outil en TEXTE (<function=...>)
+            # au lieu du format natif -> on le parse et on l'execute quand meme.
+            parsed = _parse_text_tool_calls(message.get("content", ""))
+            if parsed:
+                tool_calls = parsed
+            else:
+                final_text = message.get("content", "").strip() or "(pas de réponse)"
+                _notify("final", final_text)
+                return final_text
 
         messages.append(message)
         for call in tool_calls:
