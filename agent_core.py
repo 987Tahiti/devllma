@@ -1037,6 +1037,80 @@ def _hf_video_backend(prompt, params):
             continue  # provider suivant (credits epuises, modele indispo, etc.)
     return None
 
+def _pollinations_image_backend(prompt, params):
+    """Image via Pollinations.ai — GRATUIT, SANS CLE, illimite (aucun credit requis).
+    Backend d'image le plus robuste : marche meme si HF est a court de credits. -> (bytes,'jpg')."""
+    import urllib.parse
+    try:
+        w = int(params.get("width", 1024)); h = int(params.get("height", 1024))
+        seed = int(params.get("seed") or (abs(hash(prompt)) % 100000))
+        url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
+               f"?width={w}&height={h}&nologo=true&model=flux&seed={seed}")
+        r = _http.get(url, timeout=120)
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            return r.content, "jpg"
+    except Exception:
+        return None
+    return None
+
+def _slideshow_video_backend(prompt, params):
+    """Video GRATUITE, sans GPU ni credit : genere 4 images (Pollinations) declinant le prompt,
+    puis les assemble en mp4 avec effet zoom/pan cinematographique (Ken Burns) via ffmpeg
+    embarque (imageio-ffmpeg). Video SILENCIEUSE (~11 s). C'est le filet de securite video quand
+    fal-ai (credits) et le worker Colab (GPU) sont indisponibles. -> (bytes,'mp4') ou None."""
+    import io, os, tempfile, urllib.parse
+    try:
+        import numpy as np, imageio
+        from PIL import Image, ImageOps
+    except Exception:
+        return None  # dependances media absentes -> pas de repli slideshow
+    OUT_W, OUT_H, FPS = 1280, 720, 24
+    NFR = int(2.6 * FPS)
+    variants = ["cinematic wide establishing shot", "dramatic dynamic action moment",
+                "epic intense close-up", "atmospheric majestic finale"]
+    pans = [(0.05, -0.03), (-0.04, 0.03), (0.06, 0.0), (-0.05, -0.02)]
+    imgs = []
+    for i, v in enumerate(variants):
+        p = f"{prompt}, {v}, highly detailed, cinematic, epic, 4k"
+        url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(p)}"
+               f"?width=1280&height=720&nologo=true&model=flux&seed={1000 + i * 7}")
+        try:
+            r = _http.get(url, timeout=120)
+            if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+                imgs.append(Image.open(io.BytesIO(r.content)).convert("RGB"))
+        except Exception:
+            pass
+    if len(imgs) < 2:
+        return None
+    def ken_burns(img, n, px, py, zoom=0.16):
+        big = ImageOps.fit(img, (OUT_W * 2, OUT_H * 2), Image.LANCZOS); BW, BH = big.size; out = []
+        for i in range(n):
+            t = i / max(1, n - 1); z = 1.0 + zoom * t; cw, ch = BW / z, BH / z
+            cx = BW / 2 + px * BW * (t - 0.5); cy = BH / 2 + py * BH * (t - 0.5)
+            l = max(0, min(BW - cw, cx - cw / 2)); u = max(0, min(BH - ch, cy - ch / 2))
+            out.append(np.asarray(big.crop((int(l), int(u), int(l + cw), int(u + ch))).resize((OUT_W, OUT_H), Image.LANCZOS)))
+        return out
+    scenes = [ken_burns(im, NFR, *pans[i % len(pans)]) for i, im in enumerate(imgs)]
+    tmp = os.path.join(tempfile.gettempdir(), f"devllma_slideshow_{os.getpid()}.mp4")
+    try:
+        w = imageio.get_writer(tmp, fps=FPS, codec="libx264", quality=7,
+                               macro_block_size=8, ffmpeg_params=["-pix_fmt", "yuv420p"])
+        for si, frames in enumerate(scenes):
+            for f in frames:
+                w.append_data(f)
+            if si < len(scenes) - 1:  # fondu enchaine 10 frames
+                a = frames[-1].astype(np.float32); b = scenes[si + 1][0].astype(np.float32)
+                for k in range(10):
+                    al = (k + 1) / 11; w.append_data((a * (1 - al) + b * al).astype(np.uint8))
+        w.close()
+        data = open(tmp, "rb").read()
+        return data, "mp4"
+    except Exception:
+        return None
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
 def _colab_backend(task, prompt, params):
     """Image/video via le worker GPU Colab (si configure). -> (bytes, ext) ou None."""
     import base64
@@ -1088,34 +1162,27 @@ def _tool_generate_media(args):
     if task == "image" and "negative_prompt" not in params:
         params["negative_prompt"] = _IMG_NEGATIVE
     data = ext = backend = None
-    # Ordre de backend ADAPTE A LA TACHE :
-    #  - IMAGE : Hugging Face D'ABORD (excellent ET ne depend pas du GPU Colab -> marche meme
-    #    worker eteint), repli Colab ensuite.
-    #  - VIDEO : GPU Colab D'ABORD (seul vrai moteur video ; HF gratuit ne sert pas la video
-    #    de facon fiable). HF seulement en DERNIER recours -> on ne perd plus 3 min sur HF
-    #    avant d'aller au GPU quand le worker est dispo.
+    def _use(res, name):
+        # n'assigne que si rien n'a encore abouti ET que ce backend a produit un resultat
+        nonlocal data, ext, backend
+        if data is None and res:
+            data, ext, backend = res[0], res[1], name
+    # Ordre ADAPTE A LA TACHE, du plus GRATUIT/FIABLE au plus contraint :
+    #  - IMAGE : Pollinations D'ABORD (gratuit, sans cle, illimite -> marche TOUJOURS),
+    #    puis Hugging Face (si credits), puis GPU Colab (si worker allume).
+    #  - VIDEO : Hugging Face fal-ai (vraie video IA, consomme des credits) -> GPU Colab
+    #    (si worker) -> DIAPORAMA local gratuit (images Pollinations + montage zoom/pan
+    #    ffmpeg) qui reussit TOUJOURS sans GPU ni credit (video silencieuse ~11 s).
     if task == "image":
-        res = _hf_image_backend(prompt, params)
-        if res:
-            data, ext, backend = res[0], res[1], "Hugging Face"
-        if data is None:
-            res = _colab_backend("image", prompt, params)
-            if res:
-                data, ext, backend = res[0], res[1], "GPU Colab"
+        _use(_pollinations_image_backend(prompt, params), "Pollinations (gratuit)")
+        if data is None: _use(_hf_image_backend(prompt, params), "Hugging Face")
+        if data is None: _use(_colab_backend("image", prompt, params), "GPU Colab")
     elif task == "video":
-        # Hugging Face (fal-ai/Wan2.2) fait la video SANS le GPU Colab -> on le tente EN
-        # PREMIER (fiable, ne depend pas d'un notebook allume). Colab en repli si HF echoue.
-        res = _hf_video_backend(prompt, params)
-        if res:
-            data, ext, backend = res[0], res[1], "Hugging Face"
-        if data is None:
-            res = _colab_backend("video", prompt, params)
-            if res:
-                data, ext, backend = res[0], res[1], "GPU Colab"
+        _use(_hf_video_backend(prompt, params), "Hugging Face (fal-ai)")
+        if data is None: _use(_colab_backend("video", prompt, params), "GPU Colab")
+        if data is None: _use(_slideshow_video_backend(prompt, params), "Diaporama local (gratuit)")
     else:
-        res = _colab_backend(task, prompt, params)
-        if res:
-            data, ext, backend = res[0], res[1], "GPU Colab"
+        _use(_colab_backend(task, prompt, params), "GPU Colab")
     if data is None:
         if not mem_get("hf_token") and not mem_get("colab_url"):
             return {"error": "aucun backend media configure : demande a l'utilisateur une cle Hugging Face "
