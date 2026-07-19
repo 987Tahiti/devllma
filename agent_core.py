@@ -1014,9 +1014,12 @@ def _hf_video_backend(prompt, params):
         return None
     model = mem_get("hf_video_model") or "ali-vilab/text-to-video-ms-1.7b"
     try:
+        # timeout court (45s) : HF gratuit sert rarement la video ; comme c'est desormais
+        # le DERNIER recours (apres Colab), inutile d'attendre 3 min pour un echec probable
+        # -> on abandonne vite et on renvoie le message "demarre le worker GPU".
         r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
                        headers={"Authorization": f"Bearer {key}"},
-                       json={"inputs": prompt}, timeout=180)
+                       json={"inputs": prompt}, timeout=45)
     except requests.RequestException:
         return None
     ct = r.headers.get("content-type", "")
@@ -1075,18 +1078,29 @@ def _tool_generate_media(args):
     if task == "image" and "negative_prompt" not in params:
         params["negative_prompt"] = _IMG_NEGATIVE
     data = ext = backend = None
-    # 1) API HÉBERGÉE (Hugging Face) EN PRIORITÉ — image ET video. HF ne depend PAS de Colab,
-    #    donc si Colab est bloque/eteint, on passe naturellement par HF (demande utilisateur).
+    # Ordre de backend ADAPTE A LA TACHE :
+    #  - IMAGE : Hugging Face D'ABORD (excellent ET ne depend pas du GPU Colab -> marche meme
+    #    worker eteint), repli Colab ensuite.
+    #  - VIDEO : GPU Colab D'ABORD (seul vrai moteur video ; HF gratuit ne sert pas la video
+    #    de facon fiable). HF seulement en DERNIER recours -> on ne perd plus 3 min sur HF
+    #    avant d'aller au GPU quand le worker est dispo.
     if task == "image":
         res = _hf_image_backend(prompt, params)
         if res:
             data, ext, backend = res[0], res[1], "Hugging Face"
+        if data is None:
+            res = _colab_backend("image", prompt, params)
+            if res:
+                data, ext, backend = res[0], res[1], "GPU Colab"
     elif task == "video":
-        res = _hf_video_backend(prompt, params)
+        res = _colab_backend("video", prompt, params)
         if res:
-            data, ext, backend = res[0], res[1], "Hugging Face"
-    # 2) repli GPU Colab (image + video) si HF n'a pas abouti
-    if data is None:
+            data, ext, backend = res[0], res[1], "GPU Colab"
+        if data is None:
+            res = _hf_video_backend(prompt, params)
+            if res:
+                data, ext, backend = res[0], res[1], "Hugging Face"
+    else:
         res = _colab_backend(task, prompt, params)
         if res:
             data, ext, backend = res[0], res[1], "GPU Colab"
