@@ -79,6 +79,68 @@ def call_brain(prompt, system=None, max_tokens=450):
             return f"(brain indisponible: {e})"
     return f"(brain indisponible apres 3 tentatives: {last_err})"
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DELEGATION DE RAISONNEMENT — LLM cloud GRATUIT (sans cle) pour decharger le CPU
+# ════════════════════════════════════════════════════════════════════════════
+def cloud_llm(system, prompt, max_tokens=500, timeout=45):
+    """Delegue un raisonnement a un LLM cloud GRATUIT et SANS CLE (Pollinations text,
+    OpenAI-compatible). Sert a decharger le CPU local sur les reflexions lourdes/bloquantes
+    (le 30b local est capable mais lent sur CPU). -> texte, ou None si indispo (repli local)."""
+    try:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        r = _http.post("https://text.pollinations.ai/openai",
+                       json={"model": "openai", "messages": msgs, "max_tokens": max_tokens},
+                       timeout=timeout)
+        if r.status_code == 200:
+            try:
+                txt = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            except Exception:
+                txt = (r.text or "").strip()
+            # ne retourne pas une page d'erreur HTML/JSON deguisee
+            if txt and not txt.lstrip().startswith("<") and len(txt) > 10:
+                return txt
+    except Exception:
+        return None
+    return None
+
+
+def reason_step(system, prompt, max_tokens=500, prefer_cloud=None):
+    """Un 'sous-cerveau' de reflexion. Mode pilote par le reglage 'brain_mode' :
+      - 'auto' (defaut) / 'cloud' : delegue au cloud GRATUIT (rapide, ne bloque pas le CPU),
+        repli LOCAL si le cloud ne repond pas.
+      - 'local' : force le sous-cerveau LOCAL (100% hors-ligne, mais plus lent sur CPU).
+    Retourne (texte, source) avec source in {'cloud','local'}."""
+    if prefer_cloud is None:
+        try:
+            from db import mem_get
+            prefer_cloud = (mem_get("brain_mode") or "auto") != "local"
+        except Exception:
+            prefer_cloud = True
+    if prefer_cloud:
+        r = cloud_llm(system, prompt, max_tokens=max_tokens)
+        if r:
+            return r, "cloud"
+    r = call_brain(prompt, system=system, max_tokens=max_tokens)
+    return (r or ""), "local"
+
+
+# Sous-cerveaux specialises (chacun = un role + un prompt systeme).
+ARCHITECTE_SYS = (
+    "Tu es l'ARCHITECTE LOGICIEL de DevLLMA. Pour la demande donnee, conçois une architecture "
+    "technique CLAIRE et REALISTE (poste Windows, Python, exécution locale). Donne : la liste des "
+    "fichiers avec le rôle de chacun, les dépendances externes nécessaires, les points techniques "
+    "délicats à ne pas rater, et le point d'entrée. Concis, structuré, pas de code complet.")
+
+CRITIQUE_SYS = (
+    "Tu es le CRITIQUE TECHNIQUE de DevLLMA, exigeant mais constructif. On te donne une demande et "
+    "un plan d'architecture. Trouve les MANQUES, pièges, cas limites oubliés, risques d'erreur à "
+    "l'exécution, dépendances manquantes, ET la sur-ingénierie inutile. Réponds par une liste "
+    "COURTE de corrections concrètes à intégrer. Si le plan est déjà solide, dis-le en une ligne.")
+
 def preload_models():
     """Précharge UNIQUEMENT le modèle actif (évite de saturer la RAM avec 3 modèles)."""
     active = AGENTS["coder"]["model"]

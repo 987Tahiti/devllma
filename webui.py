@@ -25,6 +25,7 @@ from agent_core import run_agent_sync
 from ollama_client import (
     KEEP_ALIVE, BRAIN_MODEL, call_brain, preload_models, stream_agent,
     _fetch_ollama_tags, handle_pull_model, check_ollama_ready, _http, _opts,
+    cloud_llm, reason_step, ARCHITECTE_SYS, CRITIQUE_SYS,
 )
 import uvicorn
 
@@ -1547,9 +1548,52 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     conv = _history_text(sid, prompt)
     conv_note = f"\n\nCONVERSATION RECENTE (contexte ; la demande a traiter est ci-dessus):\n{conv}" if conv else ""
 
-    # ── Phase 1 : Brain pense et planifie ────────────────────────────
+    # ── Phase 1 : Cerveau de reflexion (multi-sous-cerveaux) ────────────
+    # Pour une demande SUBSTANTIELLE, on ne fait plus une seule passe : on enchaine trois
+    # sous-cerveaux — ARCHITECTE (conçoit) -> CRITIQUE (relit, trouve les manques) -> le BRAIN
+    # (synthetise le plan+todos final en integrant les deux). Les deux premieres passes sont
+    # DELEGUEES a un LLM cloud GRATUIT quand il repond (ne bloque pas le CPU) ; sinon locales.
+    # La synthese finale reste sur le brain LOCAL (format plan+todos attendu par le pipeline).
     await websocket.send_json({"type":"thinking"})
-    plan = await asyncio.get_event_loop().run_in_executor(None, call_brain, prompt + conv_note + mem_note)
+    loop = asyncio.get_event_loop()
+    brain_mode = mem_get("brain_mode") or "auto"
+    deep = len(prompt) > 180 and not is_edit(prompt)   # reflexion approfondie sur les vrais projets
+
+    async def _emit_subbrain(agent, icon, src, text):
+        await websocket.send_json({"type":"agent_start","agent":agent})
+        await websocket.send_json({"type":"brain_think","text":f"{icon} {agent.capitalize()} ({src}) :\n{text}"})
+
+    plan = None
+    if deep and brain_mode == "local":
+        # SOUS-CERVEAUX 100% LOCAUX (hors-ligne, plus lent sur CPU) — pour evaluer leur utilite.
+        archi = await loop.run_in_executor(None, call_brain, f"DEMANDE:\n{prompt}{mem_note}", ARCHITECTE_SYS, 450)
+        if cancel_event.is_set(): await websocket.send_json({"type":"done"}); return
+        await _emit_subbrain("architecte","🏛️","local",archi)
+        crit = await loop.run_in_executor(None, call_brain, f"DEMANDE:\n{prompt}\n\nPLAN PROPOSE:\n{archi}", CRITIQUE_SYS, 400)
+        if cancel_event.is_set(): await websocket.send_json({"type":"done"}); return
+        await _emit_subbrain("critique","🔍","local",crit)
+        synth_prompt = (f"{prompt}{conv_note}{mem_note}\n\nARCHITECTURE :\n{archi}\n\nCORRECTIONS (critique) :\n{crit}\n\n"
+                        f"Produis le PLAN FINAL et les TODOS en integrant l'architecture et ces corrections.")
+        plan = await loop.run_in_executor(None, call_brain, synth_prompt)
+    elif deep:
+        # CERVEAU MULTI-SOUS-CERVEAUX delegue au CLOUD GRATUIT (rapide, ne bloque pas le CPU) :
+        # ARCHITECTE (cloud) -> CRITIQUE (cloud) -> SYNTHESE (brain LOCAL, format todos fiable).
+        # On teste d'abord l'architecte en cloud PUR : s'il repond, on fait tout le cerveau ;
+        # s'il echoue (cloud indispo), on retombe direct sur le plan LOCAL UNIQUE (pas de triple
+        # passe locale lente) -> aucune regression de vitesse quand le cloud est absent.
+        archi = await loop.run_in_executor(None, lambda: cloud_llm(ARCHITECTE_SYS, f"DEMANDE:\n{prompt}{mem_note}", 500))
+        if cancel_event.is_set(): await websocket.send_json({"type":"done"}); return
+        if archi:
+            await _emit_subbrain("architecte","🏛️","cloud",archi)
+            crit = await loop.run_in_executor(None, lambda: cloud_llm(CRITIQUE_SYS, f"DEMANDE:\n{prompt}\n\nPLAN PROPOSE:\n{archi}", 450)) or ""
+            if cancel_event.is_set(): await websocket.send_json({"type":"done"}); return
+            if crit:
+                await _emit_subbrain("critique","🔍","cloud",crit)
+            synth_prompt = (f"{prompt}{conv_note}{mem_note}\n\nARCHITECTURE :\n{archi}\n\nCORRECTIONS (critique) :\n{crit}\n\n"
+                            f"Produis le PLAN FINAL et les TODOS en integrant l'architecture et ces corrections.")
+            plan = await loop.run_in_executor(None, call_brain, synth_prompt)
+    if plan is None:
+        plan = await loop.run_in_executor(None, call_brain, prompt + conv_note + mem_note)
     if cancel_event.is_set():
         await websocket.send_json({"type":"stopped"}); await websocket.send_json({"type":"done"}); return
     await websocket.send_json({"type":"agent_start","agent":"brain"})
