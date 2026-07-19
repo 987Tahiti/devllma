@@ -1004,27 +1004,37 @@ def _hf_image_backend(prompt, params):
             continue
     return None
 
+# Providers/modeles HF Inference Providers pour la VIDEO (text-to-video), dans l'ordre.
+# fal-ai / Wan2.2 fonctionne avec la cle de ce poste (verifie 18/07/2026, video mp4 produite)
+# -> plus besoin du GPU Colab pour la video. together/novita en repli.
+_HF_VIDEO_ROUTES = [
+    ("fal-ai",   "Wan-AI/Wan2.2-TI2V-5B"),
+    ("together", "Wan-AI/Wan2.2-T2V-A14B"),
+    ("novita",   "Wan-AI/Wan2.2-T2V-A14B"),
+]
+
 def _hf_video_backend(prompt, params):
-    """Video via Hugging Face Inference (text-to-video). Best-effort : honore 'si Colab
-    bloque -> essaie HF' meme pour la video. Le tier serverless gratuit reussit RAREMENT la
-    video (souvent 503 modele non charge / 404 / PRO requis) -> renvoie None si indispo, et
-    on bascule alors sur Colab. -> (bytes, ext) ou None."""
+    """Video via Hugging Face Inference Providers (text-to-video, client huggingface_hub qui
+    gere le routage/polling par provider). -> (bytes 'mp4') ou None.
+    NB : ces modeles produisent une video SILENCIEUSE (pas de bande-son) et COURTE (~5 s) ;
+    la 'musique' demandee ne peut pas etre ajoutee par le modele."""
     key = mem_get("hf_token")
     if not key:
         return None
-    model = mem_get("hf_video_model") or "ali-vilab/text-to-video-ms-1.7b"
     try:
-        # timeout court (45s) : HF gratuit sert rarement la video ; comme c'est desormais
-        # le DERNIER recours (apres Colab), inutile d'attendre 3 min pour un echec probable
-        # -> on abandonne vite et on renvoie le message "demarre le worker GPU".
-        r = _http.post(f"https://router.huggingface.co/hf-inference/models/{model}",
-                       headers={"Authorization": f"Bearer {key}"},
-                       json={"inputs": prompt}, timeout=45)
-    except requests.RequestException:
+        from huggingface_hub import InferenceClient
+    except Exception:
         return None
-    ct = r.headers.get("content-type", "")
-    if r.status_code == 200 and ("video" in ct or "gif" in ct or "mp4" in ct):
-        return r.content, ("gif" if "gif" in ct else "mp4")
+    fp = mem_get("hf_video_provider"); fm = mem_get("hf_video_model")
+    routes = [(fp, fm)] if (fp and fm) else _HF_VIDEO_ROUTES
+    for provider, model in routes:
+        try:
+            cli = InferenceClient(provider=provider, api_key=key, timeout=600)
+            vid = cli.text_to_video(prompt, model=model)
+            if vid:
+                return bytes(vid), "mp4"
+        except Exception:
+            continue  # provider suivant (credits epuises, modele indispo, etc.)
     return None
 
 def _colab_backend(task, prompt, params):
@@ -1093,13 +1103,15 @@ def _tool_generate_media(args):
             if res:
                 data, ext, backend = res[0], res[1], "GPU Colab"
     elif task == "video":
-        res = _colab_backend("video", prompt, params)
+        # Hugging Face (fal-ai/Wan2.2) fait la video SANS le GPU Colab -> on le tente EN
+        # PREMIER (fiable, ne depend pas d'un notebook allume). Colab en repli si HF echoue.
+        res = _hf_video_backend(prompt, params)
         if res:
-            data, ext, backend = res[0], res[1], "GPU Colab"
+            data, ext, backend = res[0], res[1], "Hugging Face"
         if data is None:
-            res = _hf_video_backend(prompt, params)
+            res = _colab_backend("video", prompt, params)
             if res:
-                data, ext, backend = res[0], res[1], "Hugging Face"
+                data, ext, backend = res[0], res[1], "GPU Colab"
     else:
         res = _colab_backend(task, prompt, params)
         if res:
@@ -1109,10 +1121,9 @@ def _tool_generate_media(args):
             return {"error": "aucun backend media configure : demande a l'utilisateur une cle Hugging Face "
                              "(hf_token='hf_...') pour la voie hebergee gratuite, ou l'URL d'un worker Colab."}
         if task == "video":
-            return {"error": "generation video impossible : Hugging Face gratuit ne sert pas la video de "
-                             "facon fiable (modele non charge/PRO requis) ET le worker GPU Colab est "
-                             "injoignable. Relance le notebook Colab (worker GPU) pour generer des videos. "
-                             "Les IMAGES, elles, fonctionnent via Hugging Face sans Colab."}
+            return {"error": "generation video echouee (providers Hugging Face video indisponibles ou "
+                             "credits Inference epuises, et worker GPU Colab injoignable). Reessaie dans "
+                             "quelques minutes ; si ca persiste, verifie tes credits Inference Providers HF."}
         return {"error": "generation image impossible (cle HF invalide/quota, modele en chargement, "
                          "et worker Colab injoignable). Reessaie dans 1 min ou verifie la cle Hugging Face."}
     out_dir = os.path.join(WORKSPACE_DIR, "media_out")
