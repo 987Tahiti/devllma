@@ -1053,6 +1053,36 @@ def _pollinations_image_backend(prompt, params):
         return None
     return None
 
+def _ltx_space_video_backend(prompt, params):
+    """VRAIE video ANIMEE (pas un diaporama) via le Space Hugging Face LTX-Video, qui tourne
+    sur le GPU DU SPACE (ZeroGPU) -> GRATUIT, sans cle ni credit, sans le GPU de l'utilisateur.
+    Clip ~5 s, SILENCIEUX. -> (bytes,'mp4') ou None. Peut echouer si le Space est en file
+    d'attente/hors quota -> on bascule alors sur les autres backends."""
+    try:
+        from gradio_client import Client
+    except Exception:
+        return None
+    neg = (params.get("negative_prompt")
+           or "worst quality, inconsistent motion, blurry, jittery, distorted, static, still image")
+    try:
+        c = Client("Lightricks/ltx-video-distilled")
+        res = c.predict(
+            prompt=prompt, negative_prompt=neg,
+            input_image_filepath=None, input_video_filepath=None,
+            height_ui=int(params.get("height", 512)), width_ui=int(params.get("width", 768)),
+            mode="text-to-video", duration_ui=float(params.get("seconds", 5)),
+            ui_frames_to_use=9, seed_ui=42, randomize_seed=True,
+            ui_guidance_scale=float(params.get("guidance", 1)), improve_texture_flag=True,
+            api_name="/text_to_video",
+        )
+        vid = res[0] if isinstance(res, (list, tuple)) else res
+        path = vid.get("video") if isinstance(vid, dict) else vid
+        if path and os.path.exists(path):
+            return open(path, "rb").read(), "mp4"
+    except Exception:
+        return None
+    return None
+
 def _slideshow_video_backend(prompt, params):
     """Video GRATUITE, sans GPU ni credit : genere 4 images (Pollinations) declinant le prompt,
     puis les assemble en mp4 avec effet zoom/pan cinematographique (Ken Burns) via ffmpeg
@@ -1178,8 +1208,13 @@ def _tool_generate_media(args):
         if data is None: _use(_hf_image_backend(prompt, params), "Hugging Face")
         if data is None: _use(_colab_backend("image", prompt, params), "GPU Colab")
     elif task == "video":
-        _use(_hf_video_backend(prompt, params), "Hugging Face (fal-ai)")
+        # 1) LTX-Video Space : VRAIE video animee, GRATUITE (GPU du Space), sans credit.
+        _use(_ltx_space_video_backend(prompt, params), "LTX-Video (Space HF, gratuit)")
+        # 2) fal-ai : vraie video IA de meilleure qualite mais consomme des credits HF.
+        if data is None: _use(_hf_video_backend(prompt, params), "Hugging Face (fal-ai)")
+        # 3) worker GPU Colab si allume.
         if data is None: _use(_colab_backend("video", prompt, params), "GPU Colab")
+        # 4) filet ultime : diaporama anime local (marche toujours, mais images animees).
         if data is None: _use(_slideshow_video_backend(prompt, params), "Diaporama local (gratuit)")
     else:
         _use(_colab_backend(task, prompt, params), "GPU Colab")
