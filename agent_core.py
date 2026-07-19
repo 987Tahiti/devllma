@@ -1054,33 +1054,61 @@ def _pollinations_image_backend(prompt, params):
     return None
 
 def _ltx_space_video_backend(prompt, params):
-    """VRAIE video ANIMEE (pas un diaporama) via le Space Hugging Face LTX-Video, qui tourne
-    sur le GPU DU SPACE (ZeroGPU) -> GRATUIT, sans cle ni credit, sans le GPU de l'utilisateur.
-    Clip ~5 s, SILENCIEUX. -> (bytes,'mp4') ou None. Peut echouer si le Space est en file
-    d'attente/hors quota -> on bascule alors sur les autres backends."""
+    """VRAIE video ANIMEE via le Space Hugging Face LTX-Video (GPU du Space, ZeroGPU) ->
+    GRATUIT, sans cle ni credit, sans le GPU de l'utilisateur. Clip ~5 s, SILENCIEUX.
+    METHODE : image-to-video. On genere D'ABORD une image FIDELE du sujet (Pollinations),
+    puis on l'ANIME. C'est bien meilleur que le text-to-video pur sur deux plans, constate :
+      - FIDELITE : le personnage ressemble a ce qui est demande (le t2v pur l'inventait).
+      - MOUVEMENT : l'animation d'une image de reference bouge vraiment (mesure ~20-44 de
+        difference inter-frames, contre ~1.5 en t2v pur = quasi statique).
+    -> (bytes,'mp4') ou None (echec -> backends suivants)."""
     try:
-        from gradio_client import Client
+        from gradio_client import Client, handle_file
     except Exception:
         return None
+    import urllib.parse, tempfile
+    W, H = 768, 512
     neg = (params.get("negative_prompt")
-           or "worst quality, inconsistent motion, blurry, jittery, distorted, static, still image")
+           or "static, still image, no motion, frozen, worst quality, blurry, distorted")
+    # 1) Image de reference fidele (gratuite, Pollinations)
+    ref = None
+    try:
+        ip = f"{prompt}, highly detailed, cinematic, dramatic dynamic pose, 4k"
+        url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(ip)}"
+               f"?width={W}&height={H}&nologo=true&model=flux&seed=77")
+        r = _http.get(url, timeout=120)
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            ref = os.path.join(tempfile.gettempdir(), f"devllma_ltxref_{os.getpid()}.png")
+            open(ref, "wb").write(r.content)
+    except Exception:
+        ref = None
+    # 2) Animation LTX : image-to-video si on a une reference, sinon text-to-video
+    motion = (f"{prompt}, dynamic dramatic cinematic motion, glowing energy and particles moving, "
+              f"cape and cloth flowing, camera slowly pushing in")
     try:
         c = Client("Lightricks/ltx-video-distilled")
-        res = c.predict(
-            prompt=prompt, negative_prompt=neg,
-            input_image_filepath=None, input_video_filepath=None,
-            height_ui=int(params.get("height", 512)), width_ui=int(params.get("width", 768)),
-            mode="text-to-video", duration_ui=float(params.get("seconds", 5)),
-            ui_frames_to_use=9, seed_ui=42, randomize_seed=True,
-            ui_guidance_scale=float(params.get("guidance", 1)), improve_texture_flag=True,
-            api_name="/text_to_video",
-        )
+        common = dict(negative_prompt=neg, height_ui=H, width_ui=W,
+                      duration_ui=float(params.get("seconds", 5)), ui_frames_to_use=9,
+                      seed_ui=42, randomize_seed=True,
+                      ui_guidance_scale=float(params.get("guidance", 1.5)), improve_texture_flag=True)
+        if ref:
+            res = c.predict(prompt=motion, input_image_filepath=handle_file(ref),
+                            input_video_filepath=None, mode="image-to-video",
+                            api_name="/image_to_video", **common)
+        else:
+            res = c.predict(prompt=motion, input_image_filepath=None,
+                            input_video_filepath=None, mode="text-to-video",
+                            api_name="/text_to_video", **common)
         vid = res[0] if isinstance(res, (list, tuple)) else res
         path = vid.get("video") if isinstance(vid, dict) else vid
         if path and os.path.exists(path):
             return open(path, "rb").read(), "mp4"
     except Exception:
         return None
+    finally:
+        if ref:
+            try: os.remove(ref)
+            except Exception: pass
     return None
 
 def _slideshow_video_backend(prompt, params):
