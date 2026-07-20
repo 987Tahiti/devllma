@@ -840,6 +840,14 @@ def execute_project(project_dir, timeout=15):
     child_env = dict(os.environ)
     child_env["PYTHONIOENCODING"] = "utf-8"
     child_env["PYTHONUTF8"] = "1"
+    # Un script Bash appelle souvent des utilitaires GNU (awk, sed, grep, cut...) qui vivent
+    # a cote de bash.exe dans Git\usr\bin — PAS forcement sur le PATH herite par le service
+    # SYSTEM. Sans ca : "awk: command not found" / "sed: command not found" en plein milieu
+    # d'un script Bash par ailleurs correct (constate sur un script de verification d'espace
+    # disque). On les ajoute devant le PATH existant (ne retire rien).
+    _git_bin = r"C:\Program Files\Git\usr\bin"
+    if os.path.isdir(_git_bin) and _git_bin not in child_env.get("PATH", ""):
+        child_env["PATH"] = _git_bin + os.pathsep + child_env.get("PATH", "")
     proc = None
     try:
         proc = subprocess.Popen(_interpreter_cmd(fpath), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
