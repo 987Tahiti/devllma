@@ -60,6 +60,11 @@ _LANG_DEFAULT = {
     "sql":"schema.sql","bash":"run.sh","sh":"run.sh","json":"config.json",
     "yaml":"config.yml","yml":"config.yml","txt":"requirements.txt","text":"requirements.txt",
     "dockerfile":"Dockerfile","md":"README.md","markdown":"README.md",
+    # PowerShell absent -> tombait sur "output.powershell" (mauvaise extension, jamais
+    # reconnue par find_entry_point/_interpreter_cmd qui n'attendent que ".ps1") : constate
+    # sur un script genere en bloc ```powershell au lieu du format ###FILE, projet jamais
+    # execute (project=None). "posh"/"pwsh" ajoutes par prudence (tags markdown alternatifs).
+    "powershell":"main.ps1","ps1":"main.ps1","posh":"main.ps1","pwsh":"main.ps1",
 }
 
 def extract_files(text):

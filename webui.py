@@ -2,7 +2,7 @@ import sys, os, json, requests, re, subprocess, asyncio, time, threading, queue 
 sys.path.insert(0, r"C:\Devllma")
 os.chdir(r"C:\Devllma")
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +21,10 @@ try:
     from tools import extract_error_line
 except Exception:
     extract_error_line = lambda output: (output or "")[:200]
+try:
+    from tools import web_search as _web_search
+except Exception:
+    _web_search = lambda q, n=3: []
 from agent_core import run_agent_sync
 from ollama_client import (
     KEEP_ALIVE, BRAIN_MODEL, call_brain, preload_models, stream_agent,
@@ -54,6 +58,12 @@ app.mount("/static", StaticFiles(directory=r"C:\Devllma\static"), name="static")
 SESSION_ID  = new_session("Web Session")
 WORKSPACE   = r"C:\Devllma\workspace"
 PYTHON      = r"C:\Users\Admin\AppData\Local\Programs\Python\Python311\python.exe"
+# Interpreteurs multi-langages (chemins absolus : le service tourne en tache planifiee
+# SYSTEM, dont le PATH peut differer de celui d'une session utilisateur normale).
+NODE_EXE       = r"C:\Program Files\nodejs\node.exe"
+NPM_CMD        = r"C:\Program Files\nodejs\npm.cmd"
+BASH_EXE       = r"C:\Program Files\Git\usr\bin\bash.exe"
+POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 os.makedirs(WORKSPACE, exist_ok=True)
 
 # ─── Mémoire globale du Brain ────────────────────────────────────────────────
@@ -177,7 +187,14 @@ BRAIN_FIX_SYSTEM = """Tu es le BRAIN. Du code vient d'échouer.
 Analyse l'erreur, identifie la cause EXACTE en 2 phrases.
 Dis quel fichier corriger et comment (modification précise)."""
 
-CODER_SYSTEM = """Tu es CODER, expert Python/JS/web. Tu CODES directement sans questions.
+CODER_SYSTEM = """Tu es CODER, expert Python/JS/PowerShell/Bash/web. Tu CODES directement sans questions,
+quel que soit le langage demande (PowerShell et Bash sont des langages a part entiere, traite-les avec
+le meme serieux que Python/JS — jamais de reponse "explicative" a la place du code).
+ECRIRE du code PowerShell/.ps1 est TOTALEMENT SANS DANGER, exactement comme ecrire du Python ou du JS —
+ce n'est QUE du texte source, personne ne l'execute pendant que tu l'ecris. Ne refuse JAMAIS en pretextant
+que "les scripts .ps1 sont bloques pour raisons de securite" (constate : refus errone deja produit sur une
+demande de script de sauvegarde parfaitement legitime) — un fichier .ps1 EST un livrable attendu comme
+n'importe quel .py/.js.
 
 FORMAT DE SORTIE OBLIGATOIRE. Chaque fichier commence par ###FILE: et finit par ###ENDFILE.
 EXEMPLE (à respecter EXACTEMENT, sans ``` markdown):
@@ -199,7 +216,11 @@ RÈGLES ABSOLUES:
 - requirements.txt = UNIQUEMENT les packages pip externes (ex: requests). JAMAIS la stdlib (os, sys, time, threading, argparse, json, re, queue...)
 - Respecte les contraintes: si "en parallèle" est demandé, utilise threading.Thread (start puis join), pas une boucle séquentielle
 - Code complet, jamais tronqué. Aucun texte ni ``` hors des blocs ###FILE
-- Ne JAMAIS dire "je vais faire..." — produis les blocs directement
+- Ne JAMAIS dire "je vais faire...", "je vais vous expliquer...", "voici comment utiliser..." ni aucune
+  autre phrase d'INTRODUCTION ou de MODE D'EMPLOI a la place du code — ta toute premiere ligne de reponse
+  DOIT etre "###FILE: nom". Constate (PowerShell) : le modele repond parfois une notice d'utilisation
+  ("Le script a ete cree dans...", suivi d'instructions Set-ExecutionPolicy) SANS jamais emettre le bloc
+  ###FILE -> aucun fichier ecrit, projet vide. Le mode d'emploi n'a AUCUNE valeur sans le code lui-meme.
 - Reste concis dans le HTML/CSS (pas de commentaires superflus, pas de contenu redondant) pour ne pas depasser la limite de sortie
 - Serveur web (FastAPI/Flask/etc.) -> le fichier principal DOIT se terminer par un bloc
   if __name__ == "__main__": qui lance reellement le serveur (ex: uvicorn.run(app, host="0.0.0.0", port=8000)).
@@ -410,10 +431,23 @@ def extract_files(text):
     # Extracteur robuste universel partagé (skills.py) — gère **f**, ### N. `f`, etc.
     return extract_files_robust(text)
 
+_TEMP_SUFFIX_RE = re.compile(r'(\.[A-Za-z0-9]{1,8})[._-]?temp[._-]?\d+$', re.IGNORECASE)
+
+def _sanitize_filename(fname):
+    """Retire un suffixe de fichier temporaire parasite (ex: 'main.py_temp_4' -> 'main.py',
+    'utils.py.devllma_tmp' -> 'utils.py'). Le modele emet parfois des noms en '<nom>.<ext>_temp_N'
+    (strategie ecriture-atomique jamais finalisee) : le fichier reel n'a alors PAS la bonne
+    extension et les imports entre modules echouent (from cli import ... alors que seul
+    'cli.py_temp_1' existe). Constate sur un projet livre (renommeur de fichiers)."""
+    fname = _TEMP_SUFFIX_RE.sub(r'\1', fname)
+    fname = re.sub(r'\.devllma_tmp$', '', fname, flags=re.IGNORECASE)
+    return fname
+
 def write_files(project_dir, files):
     os.makedirs(project_dir, exist_ok=True)
     created = []
     for fname, code in files:
+        fname = _sanitize_filename(fname)
         fpath = os.path.join(project_dir, fname.replace("/", os.sep))
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
         with open(fpath, "w", encoding="utf-8") as f: f.write(code)
@@ -422,6 +456,18 @@ def write_files(project_dir, files):
 
 def install_deps(project_dir):
     req = os.path.join(project_dir, "requirements.txt")
+    pkg = os.path.join(project_dir, "package.json")
+    if os.path.exists(pkg):
+        # Projet Node.js : npm install (node_modules quasi jamais fourni par le modele).
+        try:
+            r = subprocess.run([NPM_CMD, "install", "--no-audit", "--no-fund"],
+                               capture_output=True, text=True, timeout=600, cwd=project_dir,
+                               encoding="utf-8", errors="replace")
+            return r.returncode == 0, (r.stdout + r.stderr).strip()[:200]
+        except subprocess.TimeoutExpired:
+            return False, "npm install trop long (>10 min) — projet créé ; lance 'npm install' à la main si nécessaire"
+        except Exception as e:
+            return False, f"npm install interrompu : {str(e)[:150]}"
     if not os.path.exists(req): return None, None
     try:
         r = subprocess.run([PYTHON,"-m","pip","install","-r",req,"-q","--no-warn-script-location"],
@@ -441,6 +487,89 @@ def install_deps(project_dir):
 _PIP_ALIAS = {"cv2":"opencv-python","PIL":"pillow","yaml":"pyyaml","bs4":"beautifulsoup4",
               "sklearn":"scikit-learn","dotenv":"python-dotenv","dateutil":"python-dateutil",
               "serial":"pyserial","Crypto":"pycryptodome","OpenGL":"PyOpenGL"}
+
+def _pypi_resolve(pkgs):
+    """Pour chaque paquet, interroge l'API JSON PyPI (gratuite) : renvoie 'pkg==derniere_version'
+    s'il EXISTE, et l'IGNORE s'il est introuvable (404 = nom probablement hallucine par le modele
+    -> evite un 'pip install' qui echoue sur tout le fichier). Reseau KO -> on garde le nom nu
+    (comportement d'origine). Active par l'interrupteur 'Resolveur PyPI' du rail Capacites."""
+    out = []
+    for p in pkgs:
+        try:
+            r = requests.get(f"https://pypi.org/pypi/{p}/json", timeout=6)
+            if r.status_code == 200:
+                ver = (r.json().get("info") or {}).get("version")
+                out.append(f"{p}=={ver}" if ver else p)
+            elif r.status_code == 404:
+                continue  # paquet inexistant sur PyPI -> on ne l'ecrit pas
+            else:
+                out.append(p)
+        except Exception:
+            out.append(p)  # reseau indisponible -> nom nu, comme avant
+    return out
+
+_NODE_BUILTINS = {
+    "fs","path","http","https","url","crypto","os","util","events","stream",
+    "child_process","net","dns","zlib","buffer","querystring","readline","cluster",
+    "worker_threads","assert","timers","tty","dgram","v8","vm","perf_hooks","punycode",
+    "string_decoder","tls","dns/promises","fs/promises","node:fs","node:path","node:http",
+    "node:https","node:os","node:util","node:crypto","node:events","node:stream","node:url",
+}
+
+def derive_node_requirements(project_dir):
+    """Equivalent Node.js de derive_requirements : deduit package.json des require()/import
+    presents dans les .js, SANS appel LLM. Sans ca, un script utilisant axios/node-fetch/etc.
+    n'a JAMAIS de package.json -> install_deps ne lance aucun 'npm install' (il ne se declenche
+    QUE si package.json existe) -> 'Cannot find module' au premier lancement (constate, projet
+    convertisseur de devises : le modele a laisse un require('axios') sans jamais creer de
+    package.json). On ne deduit que les paquets EXTERNES (retire les modules Node natifs et les
+    imports relatifs ./x) et on n'AJOUTE que les manquants (jamais d'ecrasement d'un package.json
+    existant deja complet)."""
+    ignore = {"__pycache__", ".git", "node_modules", ".venv", "build", "dist"}
+    js_files = []
+    for root, dirs, names in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in ignore]
+        for n in names:
+            if n.endswith((".js", ".mjs", ".cjs")):
+                js_files.append(os.path.join(root, n))
+    if not js_files:
+        return []
+    found = set()
+    for fp in js_files:
+        try:
+            src = open(fp, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        for m in re.finditer(r'require\(\s*[\'"]([^\'"]+)[\'"]\s*\)'
+                              r'|(?:^|\n)\s*import\s+.*?\s+from\s+[\'"]([^\'"]+)[\'"]', src):
+            name = m.group(1) or m.group(2)
+            if not name or name.startswith((".", "/")):
+                continue  # import relatif entre fichiers du projet, pas un paquet npm
+            pkg = name.split("/")[0] if not name.startswith("@") else "/".join(name.split("/")[:2])
+            found.add(pkg)
+    external = sorted(p for p in found if p not in _NODE_BUILTINS)
+    if not external:
+        return []
+    pkg_path = os.path.join(project_dir, "package.json")
+    data = {"name": os.path.basename(project_dir.rstrip("\\/")) or "projet", "version": "1.0.0",
+            "private": True, "dependencies": {}}
+    if os.path.exists(pkg_path):
+        try:
+            data = json.load(open(pkg_path, encoding="utf-8"))
+        except Exception:
+            pass
+    data.setdefault("dependencies", {})
+    missing = [p for p in external if p not in data["dependencies"]]
+    if not missing:
+        return []
+    for p in missing:
+        data["dependencies"][p] = "latest"
+    try:
+        with open(pkg_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        return []
+    return missing
 
 def derive_requirements(project_dir):
     """Complete requirements.txt en analysant les imports (AST), SANS appel LLM : le modele
@@ -483,6 +612,11 @@ def derive_requirements(project_dir):
     missing = [p for p in external if p.lower() not in have]
     if not missing:
         return []
+    # Resolveur PyPI (rail Capacites) : verifie l'existence + epingle la version.
+    if cfg_on("pypi"):
+        resolved = _pypi_resolve(missing)
+        if resolved:
+            missing = resolved
     sep = "" if (not existing_text or existing_text.endswith("\n")) else "\n"
     try:
         with open(req_path, "a", encoding="utf-8") as f:
@@ -494,7 +628,56 @@ def derive_requirements(project_dir):
 bootstrap_memory()
 
 # ─── Exécution de code ────────────────────────────────────────────────────────
-ENTRY_POINTS = ["main.py","app.py","run.py","server.py","start.py","index.py"]
+ENTRY_POINTS = ["main.py","app.py","run.py","server.py","start.py","index.py",
+                "main.js","app.js","server.js","index.js",
+                "main.ps1","script.ps1","run.ps1","backup.ps1",
+                "main.sh","script.sh","run.sh","backup.sh"]
+
+def _interpreter_cmd(fpath):
+    """Choisit l'interpreteur/executable selon l'extension du point d'entree — le pipeline
+    ne generait/executait QUE du Python (execute_project lancait toujours [PYTHON, fpath],
+    meme pour un .js/.ps1/.sh correct -> faux echec garanti). Chemins absolus (cf. constantes
+    NODE_EXE/BASH_EXE/POWERSHELL_EXE) : le service tourne en tache SYSTEM, PATH pas fiable."""
+    ext = os.path.splitext(fpath)[1].lower()
+    if ext in (".js", ".mjs", ".cjs"):
+        return [NODE_EXE, fpath]
+    if ext == ".ps1":
+        return [POWERSHELL_EXE, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fpath]
+    if ext == ".sh":
+        return [BASH_EXE, fpath]
+    return [PYTHON, fpath]
+
+_ENTRY_IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "build", "dist", "tests"}
+
+def _main_block_entry(dir_path):
+    """Parmi les .py d'UN dossier (pas recursif), trouve celui qui contient un bloc
+    `if __name__ == "__main__"` — repli quand aucun nom standard (main.py, app.py...)
+    n'est present. Retourne le NOM DE FICHIER SEUL (pas le chemin), ou None."""
+    try:
+        py_files = [f for f in sorted(os.listdir(dir_path))
+                    if f.endswith(".py") and os.path.isfile(os.path.join(dir_path, f))]
+    except Exception:
+        return None
+    if len(py_files) == 1:
+        return py_files[0]
+    if len(py_files) <= 1:
+        return None
+    entry_candidates = []
+    for f in py_files:
+        try:
+            src = open(os.path.join(dir_path, f), encoding="utf-8").read()
+        except Exception:
+            continue
+        if re.search(r'if\s+__name__\s*==\s*["\']__main__["\']', src):
+            entry_candidates.append(f)
+    if len(entry_candidates) == 1:
+        return entry_candidates[0]
+    if entry_candidates:
+        for pref in ("main.py", "app.py", "run.py", "cli.py", "__main__.py"):
+            if pref in entry_candidates:
+                return pref
+        return entry_candidates[0]
+    return None
 
 def find_entry_point(project_dir):
     """Cherche un point d'entree a la racine, PUIS dans un sous-dossier direct
@@ -503,40 +686,29 @@ def find_entry_point(project_dir):
     for ep in ENTRY_POINTS:
         if os.path.exists(os.path.join(project_dir, ep)):
             return ep
-    ignore = {"__pycache__", ".git", "node_modules", ".venv", "build", "dist"}
-    for entry in sorted(os.listdir(project_dir)):
+    subdirs = [e for e in sorted(os.listdir(project_dir))
+               if os.path.isdir(os.path.join(project_dir, e)) and e not in _ENTRY_IGNORE_DIRS]
+    for entry in subdirs:
         sub = os.path.join(project_dir, entry)
-        if os.path.isdir(sub) and entry not in ignore:
-            for ep in ENTRY_POINTS:
-                if os.path.exists(os.path.join(sub, ep)):
-                    return os.path.join(entry, ep)
-    # Dernier recours : un script unique nomme autrement (ex: calculatrice.py seul
-    # a la racine). Sans ce fallback il n'est jamais execute ni teste — le pipeline
-    # declarait "termine" sans run_result (constate au banc de tests).
-    root_py = [f for f in sorted(os.listdir(project_dir))
-               if f.endswith(".py") and os.path.isfile(os.path.join(project_dir, f))]
-    if len(root_py) == 1:
-        return root_py[0]
-    # Plusieurs fichiers .py mais AUCUN nom d'entree standard (constate, data_05 : le modele
-    # a produit des modules sans main.py -> projet jamais execute, run_ok=None). On identifie
-    # le point d'entree reel comme le fichier qui contient un bloc `if __name__ == "__main__"`.
-    if len(root_py) > 1:
-        entry_candidates = []
-        for f in root_py:
-            try:
-                src = open(os.path.join(project_dir, f), encoding="utf-8").read()
-            except Exception:
-                continue
-            if re.search(r'if\s+__name__\s*==\s*["\']__main__["\']', src):
-                entry_candidates.append(f)
-        # Un seul candidat -> c'est lui. Plusieurs -> on privilegie un nom "principal" courant.
-        if len(entry_candidates) == 1:
-            return entry_candidates[0]
-        if entry_candidates:
-            for pref in ("main.py", "app.py", "run.py", "cli.py", "__main__.py"):
-                if pref in entry_candidates:
-                    return pref
-            return entry_candidates[0]
+        for ep in ENTRY_POINTS:
+            if os.path.exists(os.path.join(sub, ep)):
+                return os.path.join(entry, ep)
+    # Dernier recours (racine) : un script unique nomme autrement (ex: calculatrice.py seul
+    # a la racine), ou plusieurs fichiers .py sans nom standard -> on identifie le point
+    # d'entree reel comme celui qui contient un bloc `if __name__ == "__main__"` (constate,
+    # data_05 : le modele a produit des modules sans main.py -> projet jamais execute).
+    root_entry = _main_block_entry(project_dir)
+    if root_entry:
+        return root_entry
+    # Meme repli, mais DANS un sous-dossier (layout package avec noms non standards, ex:
+    # backup_tool/cli.py, backup_tool/backup.py... aucun ne s'appelle main.py). Sans ce
+    # deuxieme niveau de repli, ces projets ne sont jamais executes -> run_ok reste None
+    # indefiniment (constate, script_python_sauvegar_compression : entree reelle = cli.py
+    # dans un sous-dossier, aucun fichier racine, donc find_entry_point rendait None).
+    for entry in subdirs:
+        sub_entry = _main_block_entry(os.path.join(project_dir, entry))
+        if sub_entry:
+            return os.path.join(entry, sub_entry)
     return None
 
 def _kill_process_tree(pid):
@@ -550,7 +722,8 @@ def _kill_process_tree(pid):
         pass
 
 SERVER_MARKERS = ("uvicorn", "flask", "app.run(", "socketserver", "http.server",
-                   "runserver", "waitress", "gunicorn", "websockets.serve")
+                   "runserver", "waitress", "gunicorn", "websockets.serve",
+                   "express()", "app.listen(", "createserver", "http.createserver")
 
 def _detect_server_port(project_dir):
     """Devine le(s) port(s) qu'un projet serveur va ouvrir en scannant son code.
@@ -562,7 +735,7 @@ def _detect_server_port(project_dir):
     for root, dirs, names in os.walk(project_dir):
         dirs[:] = [d for d in dirs if d not in {"__pycache__",".git","node_modules",".venv","build","dist"}]
         for n in names:
-            if not n.endswith(".py"):
+            if not n.endswith((".py", ".js", ".mjs", ".cjs")):
                 continue
             try:
                 content = open(os.path.join(root, n), encoding="utf-8", errors="replace").read()
@@ -572,14 +745,15 @@ def _detect_server_port(project_dir):
             for mk in SERVER_MARKERS:
                 if mk in low:
                     is_server = True; frameworks.add(mk)
-            for m in re.findall(r'port\s*=\s*(\d{2,5})', content):
-                p = int(m)
+            for m in re.findall(r'\.listen\(\s*(\d{2,5})|port\s*[=:]\s*(\d{2,5})', content):
+                p = int(m[0] or m[1])
                 if p != 8080 and p not in ports:  # 8080 = PROD, jamais un projet genere
                     ports.append(p)
     # Defauts par framework (le port explicite prime, mais sert de repli s'il manque)
     if frameworks & {"flask", "app.run("} and 5000 not in ports:
         ports.append(5000)
-    if frameworks & {"uvicorn", "http.server", "runserver", "waitress", "gunicorn"} and 8000 not in ports:
+    if frameworks & {"uvicorn", "http.server", "runserver", "waitress", "gunicorn",
+                     "express()", "app.listen(", "createserver", "http.createserver"} and 8000 not in ports:
         ports.append(8000)
     if is_server and not ports:
         ports.append(8000)
@@ -668,7 +842,7 @@ def execute_project(project_dir, timeout=15):
     child_env["PYTHONUTF8"] = "1"
     proc = None
     try:
-        proc = subprocess.Popen([PYTHON, fpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(_interpreter_cmd(fpath), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, cwd=project_dir, encoding="utf-8", errors="replace",
                                 env=child_env)
         try:
@@ -688,6 +862,40 @@ def execute_project(project_dir, timeout=15):
                 or ("traceback" not in low
                     and re.search(r'(?m)^usage:', combined, re.IGNORECASE)
                     and re.search(r'\berror:', combined, re.IGNORECASE))
+                # GROUPE de sous-commandes (click.Group / argparse subparsers) lance SANS
+                # sous-commande : il affiche son aide ("Usage: ... COMMAND [ARGS]" + liste
+                # "Commands:") et sort en code != 0, mais SANS ligne "error:" -> les regex
+                # ci-dessus le rataient et le pipeline gaspillait 3 cycles de correction (voire
+                # timeout) sur du code parfaitement sain (constate, suivi_temps_travail #12).
+                # Signature = usage + (liste Commands: OU placeholder COMMAND), sans Traceback.
+                or ("traceback" not in low
+                    and re.search(r'(?m)^\s*usage:', combined, re.IGNORECASE)
+                    and (re.search(r'(?m)^\s*Commands:', combined)
+                         or re.search(r'\[OPTIONS\]\s+COMMAND', combined, re.IGNORECASE)
+                         or re.search(r'\{[\w-]+(?:,[\w-]+)+\}', combined)))
+                # GENERIQUE multi-langage (Node/PowerShell/Bash — pas de convention argparse/click) :
+                # un script qui exige un argument et s'arrete PROPREMENT avec un message court est
+                # un CLI sain lance sans ses arguments, pas un bug. Deux cas constates sur le MEME
+                # script Node.js selon la generation : "Veuillez fournir un chemin de dossier en
+                # argument." (mot-cle mais pas de "usage:"), PUIS sur une regeneration suivante
+                # juste "Usage: node main.js <dossier>" (mot "usage:" seul, sans "error:"/"Commands:"
+                # donc rate par les regles Python ci-dessus). D'ou 2 sous-cas independants :
+                # (a) mot-cle argument+requis peu importe la forme, (b) simple ligne "usage:" isolee.
+                # Dans les deux cas, on exige l'ABSENCE de toute signature de plantage (Python/JS/
+                # PowerShell/Bash confondus) et une sortie courte -> un vrai crash produit toujours
+                # une trace plus longue et reconnaissable, jamais juste une ligne d'usage propre.
+                or (len(combined) < 300
+                    and not re.search(r'traceback|exception|error:.*\bat\b|at Object\.|at Module\.|'
+                                      r'\.js:\d+|\.ps1:\d+|line \d+:.*(?:syntax error|command not found)|'
+                                      r'referenceerror|typeerror|is not recognized as',
+                                      low)
+                    and (
+                        re.search(r'\b(argument|argv|param(?:etre|eter)?|option)s?\b.*'
+                                  r'\b(requis|required|manquant|missing|fournir|provide|sp[ée]cifi)',
+                                  low)
+                        or re.search(r'\b(veuillez|please)\b.*\b(fournir|provide|sp[ée]cifi|indiqu)', low)
+                        or re.search(r'(?m)^\s*usage\s*:', low)
+                    ))
             )
             if cli_usage_exit:
                 # CLI avec argument(s) obligatoire(s) : "python main.py" SANS argument echoue
@@ -1181,6 +1389,132 @@ def pipeline_stats(limit: int = 500):
         "edits": sum(1 for r in rows if r.get("editing")),
         "last_10": rows[-10:],
     }
+
+# ── Configuration des capacites (interrupteurs du rail "Capacites" de l'UI) ──
+# Cles UI booleennes stockees en base (mem_set) et lues par le pipeline pour activer/couper
+# une capacite sans redemarrage : recherche web, auto-debug web, passe de verification,
+# tests auto, resolveur PyPI. "brain" pilote brain_mode (auto=multi-cerveaux / local).
+_UI_CFG_KEYS = {"verify", "tests", "web", "pypi", "autodebug"}
+
+def cfg_on(key, default=False):
+    """Un flag de capacite est-il actif ? (lu par le pipeline, cf. rail Capacites)."""
+    v = mem_get("cfg_" + key)
+    if v is None:
+        return default
+    return v == "1"
+
+@app.get("/config")
+def get_config():
+    bm = mem_get("brain_mode") or "auto"
+    out = {"brain": bm != "local", "brain_mode": bm}
+    # valeurs par defaut alignees sur l'UI (verify ON par defaut, le reste OFF)
+    defaults = {"verify": True, "tests": False, "web": False, "pypi": False, "autodebug": False}
+    for k in _UI_CFG_KEYS:
+        out[k] = cfg_on(k, defaults.get(k, False))
+    return out
+
+@app.post("/config")
+async def set_config(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "corps JSON invalide"}
+    key = data.get("set")
+    val = bool(data.get("value"))
+    if key in ("brain", "brain_mode"):
+        mem_set("brain_mode", "auto" if val else "local")
+    elif key in _UI_CFG_KEYS:
+        mem_set("cfg_" + key, "1" if val else "0")
+    else:
+        return {"ok": False, "error": f"cle inconnue: {key}"}
+    return {"ok": True, "set": key, "value": val}
+
+# ── Compilation .exe (bouton "Compiler en .exe" du rail Capacites) ──
+def _user_desktop():
+    """Vrai bureau de l'utilisateur. Le serveur tourne en SYSTEM -> expanduser('~') pointe
+    vers le profil systeme (system32\\config\\systemprofile) et l'exe serait invisible.
+    On resout le profil d'un utilisateur reel de C:\\Users."""
+    up = os.environ.get("USERPROFILE", "")
+    if up and "systemprofile" not in up.lower() and os.path.isdir(os.path.join(up, "Desktop")):
+        return os.path.join(up, "Desktop")
+    users = r"C:\Users"
+    for cand in ("Admin",) + tuple(os.listdir(users) if os.path.isdir(users) else ()):
+        if cand.lower() in ("default", "public", "all users", "default user"):
+            continue
+        dsk = os.path.join(users, cand, "Desktop")
+        if os.path.isdir(dsk):
+            return dsk
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+_EXE_OUT = os.path.join(_user_desktop(), "Projets-DevLLMA-EXE")
+_HEAVY_MODULES = ["torch", "tensorflow", "scipy", "matplotlib", "pandas", "numpy", "cv2",
+                  "sklearn", "diffusers", "transformers", "PIL", "IPython", "notebook",
+                  "jupyter", "sympy", "numba"]
+_EXE_ENTRIES = ["main.py", "app.py", "cli.py", "run.py", "server.py", "start.py", "index.py", "__main__.py"]
+_EXE_IGN_SUB = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".backups",
+                ".ruff_cache", "tests", "build", "dist", "logs"}
+
+def _compile_project_exe(project):
+    """Compile un projet du workspace en .exe autonome (PyInstaller --onefile), en excluant
+    les libs lourdes NON importees (torch/scipy/... -> exe leger). Detecte le point d'entree
+    (racine puis sous-dossier). Sortie: Bureau\\DevLLMA-EXE\\<projet>.exe."""
+    import shutil, tempfile
+    d = os.path.join(WORKSPACE, project)
+    if not os.path.isdir(d):
+        return {"ok": False, "error": "projet introuvable dans le workspace"}
+    ep = None
+    for e in _EXE_ENTRIES:
+        if os.path.exists(os.path.join(d, e)):
+            ep = e; break
+    if not ep:
+        for sub in sorted(os.listdir(d)):
+            sd = os.path.join(d, sub)
+            if os.path.isdir(sd) and sub not in _EXE_IGN_SUB:
+                for e in _EXE_ENTRIES:
+                    if os.path.exists(os.path.join(sd, e)):
+                        ep = os.path.join(sub, e); break
+            if ep:
+                break
+    if not ep:
+        pys = [f for f in os.listdir(d) if f.endswith(".py") and not f.startswith("_")]
+        ep = pys[0] if pys else None
+    if not ep:
+        return {"ok": False, "error": "aucun point d'entree Python trouve"}
+    txt = ""
+    for root, dirs, fs in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in _EXE_IGN_SUB]
+        for f in fs:
+            if f.endswith(".py"):
+                try:
+                    txt += open(os.path.join(root, f), encoding="utf-8", errors="ignore").read()
+                except Exception:
+                    pass
+    excludes = []
+    for m in _HEAVY_MODULES:
+        if not re.search(r'(?:^|\n)\s*(?:import|from)\s+' + re.escape(m) + r'\b', txt):
+            excludes += ["--exclude-module", m]
+    is_web = ("fastapi" in txt.lower() or "uvicorn" in txt.lower())
+    os.makedirs(_EXE_OUT, exist_ok=True)
+    work = os.path.join(tempfile.gettempdir(), "pyi_web", project)
+    shutil.rmtree(work, ignore_errors=True); os.makedirs(work, exist_ok=True)
+    cmd = [PYTHON, "-m", "PyInstaller", "--onefile", "--noconfirm", "--clean",
+           "--name", project, "--distpath", _EXE_OUT, "--workpath", work, "--specpath", work] + excludes
+    if is_web:
+        cmd += ["--collect-all", "uvicorn", "--collect-all", "fastapi", "--hidden-import", "anyio"]
+    cmd.append(ep)
+    try:
+        r = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=1200,
+                           encoding="utf-8", errors="replace")
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    exe = os.path.join(_EXE_OUT, project + ".exe")
+    if os.path.exists(exe):
+        return {"ok": True, "path": exe, "mb": round(os.path.getsize(exe) / 1e6, 1)}
+    return {"ok": False, "error": (r.stderr or r.stdout or "echec inconnu")[-300:]}
+
+@app.post("/compile_exe/{project}")
+async def compile_exe_route(project: str):
+    return await asyncio.get_event_loop().run_in_executor(None, _compile_project_exe, project)
 
 @app.post("/restore/{snapshot_id}")
 def restore_snapshot(snapshot_id: int):
@@ -1774,6 +2108,12 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         if added_deps:
             await websocket.send_json({"type":"file_created",
                 "name":f"requirements.txt (+{len(added_deps)} dépendance(s) déduite(s): {', '.join(added_deps[:6])})","size":""})
+        # Equivalent Node.js : deduire package.json des require()/import (meme raison : le
+        # modele utilise souvent axios/node-fetch/etc. sans jamais creer package.json).
+        added_node_deps = await asyncio.get_event_loop().run_in_executor(None, derive_node_requirements, project_dir)
+        if added_node_deps:
+            await websocket.send_json({"type":"file_created",
+                "name":f"package.json (+{len(added_node_deps)} dépendance(s) déduite(s): {', '.join(added_node_deps[:6])})","size":""})
         # Installer les dépendances
         ok_dep, _ = await asyncio.get_event_loop().run_in_executor(None, install_deps, project_dir)
 
@@ -1845,10 +2185,34 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         await websocket.send_json({"type":"agent_start","agent":"brain"})
                         await websocket.send_json({"type":"brain_think","text":analysis})
 
+                    # ── Auto-debug web (rail Capacites) : quand on est BLOQUE sur la meme
+                    # erreur et que la capacite est active, on recherche l'erreur sur le web
+                    # (DuckDuckGo, gratuit) et on injecte des pistes dans le prompt de
+                    # correction. Gate sur escalate uniquement -> aucun cout tant que le
+                    # modele progresse tout seul.
+                    web_note = ""
+                    if escalate and cfg_on("autodebug"):
+                        try:
+                            q = ((clean_err or "")[:120] + " python").strip()
+                            hits = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda: _web_search(q, 3))
+                            good = [h for h in (hits or []) if h.get("url") and h.get("snippet")]
+                            if good:
+                                web_note = ("PISTES WEB (recherche sur l'erreur — inspire-toi de la "
+                                            "cause, ne copie pas aveuglement) :\n"
+                                            + "\n".join(f"- {(h.get('title') or '')[:80]} : "
+                                                        f"{(h.get('snippet') or '')[:160]}" for h in good[:3])
+                                            + "\n\n")
+                                await websocket.send_json({"type":"agent_start","agent":"researcher"})
+                                await websocket.send_json({"type":"brain_think",
+                                    "text":"\U0001F50E Recherche web sur l'erreur : "+q+"\n"+web_note})
+                        except Exception:
+                            pass
+
                     # Agent corrige (n'injecte la section ANALYSE que si le brain a tourne)
                     analyse_note = f"ANALYSE:\n{analysis}\n\n" if analysis else ""
                     fix_p = (f"ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
-                             f"{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
+                             f"{web_note}{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
                              f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
                              f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
                     # Bloqué (escalate) OU deja en mode Colab -> on delegue la correction au GPU.
@@ -1905,6 +2269,110 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             await asyncio.get_event_loop().run_in_executor(
                 None, Skills.git_commit, project_dir, f"DevLLMA: {project_name} OK"
             )
+
+        # ── Passe de verification + AUTO-CORRECTION ciblee (rail Capacites) ──
+        # L'execution prouve que le code TOURNE, pas qu'il REPOND a la demande. Un relecteur
+        # compare code vs demande ; s'il trouve des ecarts CONCRETS et que le code tourne, on
+        # lance UNE passe corrective ciblee, PROTEGEE PAR SNAPSHOT : si la correction regresse
+        # (ne tourne plus), on restaure la version qui marchait -> jamais de regression.
+        if cfg_on("verify", True):
+            try:
+                _verify_sys = ("Tu es un relecteur de code exigeant. On te donne une demande et le "
+                               "code produit. Dis si le code REPOND vraiment a la demande. Reponds "
+                               "exactement 'CONFORME' si tout y est ; sinon liste au maximum 3 ecarts "
+                               "CONCRETS (fonctionnalite manquante ou bug logique), une ligne chacun. "
+                               "Sois bref et factuel, pas de bla-bla.")
+                cur_files = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+                verify_ctx = (f"DEMANDE:\n{prompt[:800]}\n\nCODE PRODUIT:\n{format_context(cur_files)}")
+                verdict = await asyncio.get_event_loop().run_in_executor(
+                    None, call_brain, verify_ctx, _verify_sys, 300)
+                verdict = (verdict or "").strip()
+                if verdict and not verdict.startswith("("):  # "(...indisponible...)" = panne Ollama
+                    conforme = verdict.upper().strip(" .\"'") == "CONFORME"
+                    await websocket.send_json({"type":"agent_start","agent":"reviewer"})
+                    if conforme:
+                        await websocket.send_json({"type":"brain_think",
+                            "text":"✅ Vérification : le code répond à la demande."})
+                    else:
+                        await websocket.send_json({"type":"brain_think",
+                            "text":"\U0001F50D Vérification — écarts détectés :\n" + verdict})
+                        if run_ok and not cancel_event.is_set():
+                            snap = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda: SnapshotManager.snapshot(project_dir, label="avant-verif-fix"))
+                            vfix_p = (f"La DEMANDE etait :\n{prompt[:800]}\n\nEcarts releves par le relecteur "
+                                      f"a corriger :\n{verdict}\n\nCODE ACTUEL :\n{format_context(cur_files)}\n\n"
+                                      f"Corrige UNIQUEMENT ces ecarts sans casser ce qui marche deja. "
+                                      f"Format strict :\n###FILE: nom.ext\n<code>\n###ENDFILE")
+                            vfix_resp = await _gen_code(websocket, agent_name, vfix_p, coder_fix_system_dyn,
+                                                        cancel_event, temperature=0.2, via_colab=big_project)
+                            vfixed = extract_files(vfix_resp)
+                            vapplied = []
+                            for fn, code in vfixed:
+                                old = cur_files.get(fn, "")
+                                if old and len(old) > 200 and len(code) < 0.4 * len(old):
+                                    continue
+                                vapplied.append((fn, code))
+                            if vapplied:
+                                await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, vapplied)
+                                vstat = await asyncio.get_event_loop().run_in_executor(None, syntax_check, project_dir)
+                                r2ok = False
+                                if not vstat:
+                                    r2ok, r2out, r2entry = await asyncio.get_event_loop().run_in_executor(
+                                        None, execute_project, project_dir)
+                                if r2ok:
+                                    run_ok, run_out = True, r2out
+                                    await websocket.send_json({"type":"run_result","ok":True,"output":r2out,"entry":r2entry})
+                                    await websocket.send_json({"type":"brain_think",
+                                        "text":"✅ Écarts corrigés — le projet répond maintenant à la demande."})
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, Skills.git_commit, project_dir, f"DevLLMA: {project_name} verif OK")
+                                else:
+                                    sid = snap[0] if snap else None
+                                    if sid:
+                                        await asyncio.get_event_loop().run_in_executor(
+                                            None, lambda: SnapshotManager.restore(sid, project_dir))
+                                    await websocket.send_json({"type":"brain_think",
+                                        "text":"⚠️ Correction des écarts non concluante — version fonctionnelle précédente restaurée."})
+            except Exception:
+                pass
+
+        # ── Tests auto-generes (rail Capacites) — garde-fou supplementaire a l'execution.
+        # execute_project prouve seulement que le point d'entree ne plante pas AU LANCEMENT ;
+        # des fonctions annexes jamais appelees par ce chemin peuvent rester cassees sans que
+        # rien ne le detecte. Scope Python uniquement (pytest) : generaliser a JS/PowerShell/Bash
+        # demanderait un framework de test par langage, hors scope pour l'instant. Informatif —
+        # un echec de test n'annule jamais le run_ok deja obtenu (pas de garde-fou bloquant ici).
+        if cfg_on("tests") and run_ok and entry and entry.endswith(".py") and not cancel_event.is_set():
+            try:
+                cur_files = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+                _test_sys = ("Tu es un ingenieur QA Python. On te donne un projet Python fonctionnel. "
+                             "Ecris UN SEUL fichier de tests pytest qui teste les fonctions/logiques "
+                             "CLES du projet (pas de test bidon, pas de test qui depend d'un reseau "
+                             "ou d'un serveur externe). Format strict :\n"
+                             "###FILE: tests/test_main.py\n<code>\n###ENDFILE")
+                test_ctx = f"DEMANDE INITIALE: {prompt[:500]}\n\nCODE DU PROJET:\n{format_context(cur_files)}"
+                test_resp = await _gen_code(websocket, agent_name, test_ctx, _test_sys,
+                                            cancel_event, temperature=0.2)
+                test_files = [(fn, code) for fn, code in extract_files(test_resp)
+                              if fn.endswith(".py") and "test" in fn.lower()]
+                if test_files and not cancel_event.is_set():
+                    await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, test_files)
+                    for fn, _ in test_files:
+                        await websocket.send_json({"type":"file_created","name":fn,"size":""})
+                    r = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: subprocess.run(
+                            [PYTHON, "-m", "pytest", "-q", "--tb=line"], cwd=project_dir,
+                            capture_output=True, text=True, timeout=60,
+                            encoding="utf-8", errors="replace"))
+                    tests_out = (r.stdout + r.stderr).strip()[:600]
+                    tests_passed = r.returncode == 0
+                    await websocket.send_json({"type":"agent_start","agent":"tester"})
+                    await websocket.send_json({"type":"brain_think",
+                        "text": ("🧪 Tests générés et exécutés — "
+                                 + ("tous passent ✅" if tests_passed else "certains échouent ⚠️")
+                                 + f"\n{tests_out}")})
+            except Exception:
+                pass
 
     # Marquer dernier todo done
     for i,t in enumerate(todos):

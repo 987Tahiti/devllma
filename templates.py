@@ -23,11 +23,14 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0d1117;--sf:#161b22;--sf2:#1c2128;--bd:#30363d;
-  --bl:#58a6ff;--gn:#3fb950;--pu:#bc8cff;--or:#f97316;--rd:#ef4444;
-  --tx:#e6edf3;--mu:#8b949e
+  --bg:#0c0f14;--sf:#12161d;--sf2:#1a212b;--sf3:#212a37;--bd:#262f3d;--bd2:#334152;
+  --bl:#7c74ff;--gn:#4ade80;--pu:#a78bfa;--or:#fb923c;--rd:#f87171;
+  --tx:#e8edf4;--mu:#8b98ac;--mu2:#5f6c7e;
+  --acc:#7c74ff;--acc-d:#6a61f5;--acc-glow:#7c74ff2e;
+  --mono:"SF Mono","Cascadia Code","JetBrains Mono",ui-monospace,Consolas,monospace;
+  --sans:"SF Pro Display","Segoe UI Variable Display","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,sans-serif
 }
-body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 /* Header */
 header{padding:8px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
 .logo{font-family:monospace;font-size:.95rem;font-weight:700;color:var(--bl);letter-spacing:-.02em}
@@ -82,7 +85,7 @@ select{margin-left:auto;background:var(--sf);border:1px solid var(--bd);color:va
 .msg.agent{align-self:flex-start;align-items:flex-start;width:100%;max-width:100%}
 .atag{font-size:.58rem;font-family:monospace;padding:2px 6px;border-radius:3px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;display:inline-block;margin-bottom:2px}
 .bbl{padding:9px 13px;border-radius:10px;font-size:.83rem;line-height:1.7;white-space:pre-wrap;word-break:break-word}
-.msg.user .bbl{background:#1f6feb;color:#fff;border-bottom-right-radius:3px}
+.msg.user .bbl{background:var(--acc);color:#fff;border-bottom-right-radius:4px;box-shadow:0 4px 16px var(--acc-glow)}
 .msg.agent .bbl{background:var(--sf);border:1px solid var(--bd);border-bottom-left-radius:3px;width:100%}
 .bbl code{font-family:monospace;background:#0d1117;padding:1px 4px;border-radius:3px;font-size:.77rem;color:#79c0ff}
 .bbl pre{background:#0d1117;border:1px solid var(--bd);border-radius:6px;padding:9px 11px;overflow-x:auto;margin:6px 0;font-size:.73rem;font-family:monospace;line-height:1.5}
@@ -186,7 +189,7 @@ select{margin-left:auto;background:var(--sf);border:1px solid var(--bd);color:va
 /* Horodatage message */
 .msg-time{font-size:.58rem;color:var(--mu);font-family:monospace;margin-top:1px}
 /* Theme clair */
-body.light{--bg:#f6f8fa;--sf:#ffffff;--sf2:#eef1f4;--bd:#d0d7de;--tx:#1f2328;--mu:#57606a}
+body.light{--bg:#f4f6fb;--sf:#ffffff;--sf2:#eef2f8;--sf3:#e5ebf4;--bd:#dde4ee;--bd2:#c8d3e2;--bl:#6257e8;--gn:#16a34a;--pu:#7c3aed;--or:#d97706;--rd:#dc2626;--tx:#161c26;--mu:#5a6879;--mu2:#8c98a8;--acc:#6257e8;--acc-d:#5147d8;--acc-glow:#6257e820}
 body.light .bbl code{background:#eef1f4;color:#0550ae}
 body.light .bbl pre{background:#f6f8fa}
 /* Sécurité */
@@ -217,7 +220,7 @@ body.light .bbl pre{background:#f6f8fa}
 /* Footer */
 footer{padding:9px 16px;border-top:1px solid var(--bd);display:flex;gap:7px;flex-shrink:0}
 #inp{flex:1;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;color:var(--tx);font-size:.86rem;resize:none;height:40px;max-height:140px;overflow-y:auto;outline:none;font-family:inherit;transition:border-color .2s}
-#inp:focus{border-color:var(--bl)}
+#inp:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
 #btn{background:var(--bl);color:#fff;border:none;border-radius:8px;padding:0 15px;font-size:.86rem;cursor:pointer;font-weight:600;height:40px;white-space:nowrap}
 #btn:disabled{opacity:.4;cursor:not-allowed}
 #clipBtn{background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-radius:8px;width:40px;height:40px;font-size:1.05rem;cursor:pointer;flex-shrink:0}
@@ -313,6 +316,27 @@ body.dragging{outline:3px dashed var(--bl);outline-offset:-6px}
   #btn,#stopBtn,#clipBtn,#saveTplBtn{min-width:40px}
   .slash-item,.mem-row,.tree-file,.tree-dir{padding-top:9px;padding-bottom:9px}
 }
+/* ── Rail Capacités (menu de fonctionnalités) ── */
+#capabilities{width:288px;flex-shrink:0;border-left:1px solid var(--bd);background:var(--sf);display:flex;flex-direction:column;overflow:hidden}
+.cx-h{font-family:var(--mono);font-size:.62rem;color:var(--mu2);text-transform:uppercase;letter-spacing:.11em;padding:14px 16px 7px;flex-shrink:0}
+.cx-scroll{flex:1;overflow-y:auto;padding:0 10px 10px}
+.cx-grp{margin-bottom:2px}
+.cx-glbl{font-family:var(--mono);font-size:.6rem;color:var(--mu2);text-transform:uppercase;letter-spacing:.1em;padding:12px 8px 6px;display:flex;align-items:center;gap:8px}
+.cx-glbl .ln{flex:1;height:1px;background:var(--bd)}
+.cx-btn{display:flex;align-items:center;gap:11px;width:100%;text-align:left;padding:8px 10px;border-radius:9px;border:1px solid transparent;background:none;color:var(--tx);cursor:pointer;transition:background .13s,border-color .13s;font-family:var(--sans);font-size:.8rem}
+.cx-btn:hover{background:var(--sf2);border-color:var(--bd)}
+.cx-ic{width:29px;height:29px;border-radius:8px;background:var(--sf2);border:1px solid var(--bd);display:grid;place-items:center;flex-shrink:0;font-size:.86rem}
+.cx-btn:hover .cx-ic{border-color:var(--acc)}
+.cx-txt{flex:1;min-width:0}
+.cx-txt b{display:block;font-weight:600;font-size:.8rem;color:var(--tx)}
+.cx-txt span{display:block;font-size:.66rem;color:var(--mu);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cx-tg{width:33px;height:18px;border-radius:20px;background:var(--sf3);border:1px solid var(--bd);position:relative;transition:.18s;flex-shrink:0}
+.cx-tg::after{content:"";position:absolute;top:1px;left:1px;width:14px;height:14px;border-radius:50%;background:var(--mu);transition:.18s}
+.cx-tg.on{background:var(--acc);border-color:var(--acc)}
+.cx-tg.on::after{left:16px;background:#fff}
+.cx-badge{font-family:var(--mono);font-size:.6rem;color:var(--acc);background:var(--acc-glow);border:1px solid var(--acc-glow);padding:2px 7px;border-radius:20px;flex-shrink:0}
+.cx-foot{font-family:var(--mono);font-size:.6rem;color:var(--mu2);text-align:center;padding:12px;border-top:1px solid var(--bd);flex-shrink:0}
+@media (max-width:1180px){#capabilities{display:none}}
 </style>
 </head>
 <body>
@@ -372,6 +396,39 @@ body.dragging{outline:3px dashed var(--bl);outline-offset:-6px}
     </footer>
     <button id="scrollBtn" onclick="chat.scrollTop=chat.scrollHeight" title="Aller en bas">&#8595;</button>
   </div>
+  <aside id="capabilities">
+    <div class="cx-h">&#9881; Capacit&#233;s</div>
+    <div class="cx-scroll">
+      <div class="cx-grp">
+        <div class="cx-glbl">G&#233;n&#233;ration <span class="ln"></span></div>
+        <button class="cx-btn" onclick="capNew()"><span class="cx-ic">&#10133;</span><span class="cx-txt"><b>Nouveau projet</b><span>d&#233;crire une id&#233;e &#224; construire</span></span></button>
+        <button class="cx-btn" onclick="capEdit()"><span class="cx-ic">&#9998;</span><span class="cx-txt"><b>Modifier un projet</b><span>&#233;diter un projet existant</span></span></button>
+      </div>
+      <div class="cx-grp">
+        <div class="cx-glbl">Fiabilit&#233; <span class="ln"></span></div>
+        <button class="cx-btn" onclick="capTgl('brain',event)"><span class="cx-ic">&#129504;</span><span class="cx-txt"><b>Multi-cerveaux</b><span>architecte &#183; critique &#183; synth&#232;se</span></span><span class="cx-tg on" id="tg-brain"></span></button>
+        <button class="cx-btn" onclick="capTgl('verify',event)"><span class="cx-ic">&#10004;</span><span class="cx-txt"><b>Passe de v&#233;rification</b><span>relecture critique du code</span></span><span class="cx-tg on" id="tg-verify"></span></button>
+        <button class="cx-btn" onclick="capTgl('tests',event)"><span class="cx-ic">&#129514;</span><span class="cx-txt"><b>Tests auto-g&#233;n&#233;r&#233;s</b><span>garde-fou &#224; l'ex&#233;cution</span></span><span class="cx-tg" id="tg-tests"></span></button>
+      </div>
+      <div class="cx-grp">
+        <div class="cx-glbl">Outils internet <span class="ln"></span></div>
+        <button class="cx-btn" onclick="capTgl('web',event)"><span class="cx-ic">&#128269;</span><span class="cx-txt"><b>Recherche web</b><span>doc &amp; erreurs quand il bloque</span></span><span class="cx-tg" id="tg-web"></span></button>
+        <button class="cx-btn" onclick="capTgl('pypi',event)"><span class="cx-ic">&#128230;</span><span class="cx-txt"><b>R&#233;solveur PyPI</b><span>bonnes versions des paquets</span></span><span class="cx-tg" id="tg-pypi"></span></button>
+        <button class="cx-btn" onclick="capTgl('autodebug',event)"><span class="cx-ic">&#128027;</span><span class="cx-txt"><b>Auto-debug web</b><span>recherche l'erreur, corrige</span></span><span class="cx-tg" id="tg-autodebug"></span></button>
+      </div>
+      <div class="cx-grp">
+        <div class="cx-glbl">Compilation <span class="ln"></span></div>
+        <button class="cx-btn" onclick="capExe()"><span class="cx-ic">&#128229;</span><span class="cx-txt"><b>Compiler en .exe</b><span>ex&#233;cutable autonome Windows</span></span><span class="cx-badge">.exe</span></button>
+      </div>
+      <div class="cx-grp">
+        <div class="cx-glbl">Base de connaissances <span class="ln"></span></div>
+        <button class="cx-btn" onclick="openMemModal()"><span class="cx-ic">&#129504;</span><span class="cx-txt"><b>M&#233;moire s&#233;mantique</b><span>recherche RAG du workspace</span></span></button>
+        <button class="cx-btn" onclick="capStats()"><span class="cx-ic">&#128202;</span><span class="cx-txt"><b>Statistiques</b><span>taux de r&#233;ussite du pipeline</span></span></button>
+        <button class="cx-btn" onclick="openModelsModal()"><span class="cx-ic">&#128230;</span><span class="cx-txt"><b>Mod&#232;les IA</b><span>g&#233;rer les mod&#232;les Ollama</span></span></button>
+      </div>
+    </div>
+    <div class="cx-foot">100 % local &#183; CPU &#183; rien ne sort</div>
+  </aside>
 </div>
 <!-- Panneau de gestion des modeles Ollama -->
 <div id="modelsModal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeModelsModal()">
@@ -1099,6 +1156,40 @@ document.addEventListener("drop",e=>{
   const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];
   if(f){handleFile(f);e.preventDefault();}
 });
+// ── Rail Capacites : actions et interrupteurs de fonctionnalites ──
+function capNew(){inp.focus();closeSidebarIfCompact();}
+function capEdit(){if(!inp.value.trim())inp.value="Modifie le projet : ";inp.focus();}
+function capTgl(key,ev){
+  const tg=document.getElementById("tg-"+key);if(!tg)return;
+  const on=tg.classList.toggle("on");
+  fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({set:key,value:on})}).catch(()=>{});
+}
+function capExe(){
+  var def=(typeof projList!=="undefined"&&projList&&projList.length)?
+    (typeof projList[0]==="string"?projList[0]:(projList[0].name||"")):"";
+  var p=prompt("Nom du projet (workspace) a compiler en .exe :",def);
+  if(!p)return;
+  alert("Compilation de « "+p+" » lancee — 1 a 3 min. Une alerte s'affichera a la fin.");
+  fetch("/compile_exe/"+encodeURIComponent(p),{method:"POST"}).then(r=>r.json()).then(function(d){
+    if(d&&d.ok)alert("✅ .exe cree :\n"+d.path+"\n("+d.mb+" Mo)");
+    else alert("❌ Echec compilation : "+((d&&d.error)||"inconnu"));
+  }).catch(function(){alert("❌ Compilation : erreur reseau.");});
+}
+function capStats(){
+  fetch("/pipeline_stats").then(r=>r.json()).then(d=>{
+    const parts=Object.entries(d||{}).map(function(e){return e[0]+" : "+e[1];}).join("\n");
+    alert("Statistiques du pipeline\n\n"+(parts||"aucune donnee"));
+  }).catch(function(){alert("Statistiques indisponibles pour le moment.");});
+}
+// Synchronise l'etat des interrupteurs depuis le backend (source de verite)
+fetch("/config").then(r=>r.json()).then(function(c){
+  ["brain","verify","tests","web","pypi","autodebug"].forEach(function(k){
+    const tg=document.getElementById("tg-"+k);
+    if(tg&&typeof c[k]!=="undefined")tg.classList.toggle("on",!!c[k]);
+  });
+}).catch(function(){});
+
 connect();
 // ── PWA : enregistrement du service worker (installabilite sur Android/iOS) ──
 if("serviceWorker" in navigator){
