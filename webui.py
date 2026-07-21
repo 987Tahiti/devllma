@@ -208,6 +208,13 @@ def f():
 ###ENDFILE
 
 RÈGLES ABSOLUES:
+- Application Android / APK -> traite EXACTEMENT comme un site web statique ci-dessous : produis
+  UNIQUEMENT index.html/style.css/main.js (interface complete, responsive, pensee pour un ecran
+  de telephone). INTERDICTION ABSOLUE de Kivy, Buildozer, buildozer.spec, Kotlin, Java ou Gradle
+  meme si c'est ta premiere idee pour "app Android" — le pipeline ne sait PAS les compiler, seul
+  le HTML/CSS/JS est automatiquement empaquete en APK reel (squelette Android WebView deja teste
+  et fonctionnel). TOUJOURS produire un fichier nomme EXACTEMENT "index.html" (sinon l'empaquetage
+  echoue) — AUCUN autre fichier Python/Kivy ne doit etre cree pour cette demande.
 - Site web statique (HTML/CSS/JS, pas de backend demandé) -> produis DIRECTEMENT index.html, style.css, main.js etc.
   EN CLAIR (pas de balises ``` a l'interieur du bloc ###FILE). N'ECRIS JAMAIS de script Python qui genere/ecrit
   ces fichiers a la place — les fichiers eux-memes sont le livrable.
@@ -515,6 +522,84 @@ _NODE_BUILTINS = {
     "string_decoder","tls","dns/promises","fs/promises","node:fs","node:path","node:http",
     "node:https","node:os","node:util","node:crypto","node:events","node:stream","node:url",
 }
+
+# ── Generation d'APK Android (WebView) ────────────────────────────────────────
+# Approche : plutot que d'esperer que le modele ecrive du Kotlin/Java Android natif
+# correct (jamais teste, tres peu fiable sur un modele CPU local), on reutilise sa
+# vraie force (HTML/CSS/JS) dans un squelette Android FIXE (WebView) deja teste et
+# valide manuellement (build reussi, cf. C:\Devllma\templates\android_webview).
+ANDROID_JAVA_HOME = r"C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
+ANDROID_TEMPLATE_DIR = r"C:\Devllma\templates\android_webview"
+ANDROID_SDK_ROOT = r"C:\Android\Sdk"
+
+_APK_KEYWORDS = re.compile(
+    r"\bapk\b|application\s+android|app\s+android|application\s+mobile|"
+    r"application\s+pour\s+(?:android|smartphone|t[ée]l[ée]phone)",
+    re.IGNORECASE)
+
+def wants_android_apk(prompt):
+    """Detecte une demande d'application Android/APK dans le prompt utilisateur."""
+    return bool(_APK_KEYWORDS.search(prompt or ""))
+
+def build_android_apk(project_dir, html_files):
+    """Copie le squelette Android WebView, y injecte le contenu web genere (HTML/CSS/JS),
+    compile via le wrapper Gradle du template (gradlew assembleDebug), et copie l'APK
+    resultant dans project_dir. Retourne (ok, message, apk_path|None)."""
+    import shutil
+    if not os.path.isdir(ANDROID_TEMPLATE_DIR):
+        return False, "Squelette Android introuvable (ANDROID_TEMPLATE_DIR manquant).", None
+    android_dir = os.path.join(project_dir, "android")
+    try:
+        if os.path.isdir(android_dir):
+            shutil.rmtree(android_dir)
+        shutil.copytree(ANDROID_TEMPLATE_DIR, android_dir,
+                        ignore=shutil.ignore_patterns(".gradle", "build", "*.apk"))
+    except Exception as e:
+        return False, f"Copie du squelette Android impossible : {e}", None
+
+    www_dir = os.path.join(android_dir, "app", "src", "main", "assets", "www")
+    try:
+        # Vider le placeholder par defaut avant d'ecrire le vrai contenu genere.
+        for f in os.listdir(www_dir):
+            os.remove(os.path.join(www_dir, f))
+        for fname, code in html_files:
+            fpath = os.path.join(www_dir, fname.replace("/", os.sep))
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(code)
+        if not any(f.lower() == "index.html" for f, _ in html_files):
+            return False, "Aucun index.html parmi les fichiers generes — impossible de construire l'APK.", None
+    except Exception as e:
+        return False, f"Ecriture du contenu web dans le squelette impossible : {e}", None
+
+    child_env = dict(os.environ)
+    child_env["JAVA_HOME"] = ANDROID_JAVA_HOME
+    # SDK fourni via variable d'environnement (pas de local.properties dans le template :
+    # ce fichier contient un chemin absolu specifique a la machine, ne doit pas etre versionne).
+    child_env["ANDROID_HOME"] = ANDROID_SDK_ROOT
+    child_env["ANDROID_SDK_ROOT"] = ANDROID_SDK_ROOT
+    gradlew = os.path.join(android_dir, "gradlew.bat")
+    try:
+        r = subprocess.run([gradlew, "assembleDebug"], cwd=android_dir, capture_output=True,
+                           text=True, timeout=600, encoding="utf-8", errors="replace", env=child_env)
+    except subprocess.TimeoutExpired:
+        return False, "Compilation Gradle trop longue (>10 min).", None
+    except Exception as e:
+        return False, f"Lancement de Gradle impossible : {e}", None
+
+    out = (r.stdout + r.stderr).strip()
+    apk_src = os.path.join(android_dir, "app", "build", "outputs", "apk", "debug", "app-debug.apk")
+    if r.returncode != 0 or not os.path.exists(apk_src):
+        return False, out[-1200:], None
+
+    apk_name = (os.path.basename(project_dir.rstrip("\\/")) or "application") + ".apk"
+    apk_dst = os.path.join(project_dir, apk_name)
+    try:
+        shutil.copy2(apk_src, apk_dst)
+    except Exception as e:
+        return True, f"APK compile mais copie impossible ({e}) : {apk_src}", apk_src
+    mb = round(os.path.getsize(apk_dst) / 1e6, 2)
+    return True, f"APK genere avec succes : {apk_name} ({mb} Mo)", apk_dst
 
 def derive_node_requirements(project_dir):
     """Equivalent Node.js de derive_requirements : deduit package.json des require()/import
@@ -1980,12 +2065,22 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
     agent_name = agents_needed[0]
     consigne = ("MODIFIE le code existant ci-dessus selon la demande (réécris les fichiers changés en entier, garde les autres)."
                 if existing else "Crée TOUS les fichiers nécessaires (main.py en premier). Code prêt à lancer.")
+    # Rappel renforce et repete pres de la demande (pas seulement dans le system prompt) : le
+    # modele a un fort reflexe "Kivy/Buildozer" pour "application Android" malgre l'interdiction
+    # dans CODER_SYSTEM (constate : a produit main.py+buildozer.spec au lieu de index.html au
+    # premier essai). Repeter la contrainte juste avant la generation reduit ce biais.
+    apk_reminder = (
+        "\n\nRAPPEL CRITIQUE : ceci est une demande d'APPLICATION ANDROID. Produis UNIQUEMENT "
+        "index.html, style.css, main.js (interface mobile complete). N'utilise JAMAIS Kivy, "
+        "Buildozer ou Kotlin/Java — ils ne seront PAS compiles par ce pipeline."
+        if wants_android_apk(prompt) else ""
+    )
     enriched = (
         f"PLAN DU BRAIN:\n{plan}\n\n"
         f"DEMANDE: {prompt}{ctx_note}{conv_note}{mem_note}\n\n"
         f"Projet: C:\\Devllma\\workspace\\{project_name}\\\n"
         f"Produis chaque fichier au format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE\n"
-        f"{consigne}"
+        f"{consigne}{apk_reminder}"
     )
     code_resp = await _gen_code(websocket, agent_name, enriched, coder_system_dyn, cancel_event,
                                 via_colab=big_project)
@@ -2002,6 +2097,29 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
 
     # ── Phase 4 : Écrire les fichiers (avec sauvegarde) ──────────────
     files = extract_files(code_resp)
+
+    # Correction ciblee : demande APK mais pas d'index.html (constate : le modele a un reflexe
+    # Kivy/Buildozer tres fort sur "application Android", au point d'ignorer a la fois la regle
+    # CODER_SYSTEM et le rappel renforce dans le prompt). Plutot que d'echouer directement, ON
+    # REDEMANDE UNE FOIS en pointant precisement ce qui a ete ecrit a la place — un rappel
+    # ABSTRAIT ne suffit pas, mais citer les noms de fichiers concrets deja produits (preuve
+    # qu'il a devie) est plus efficace pour corriger le cap.
+    if wants_android_apk(prompt) and not any(fn.lower() == "index.html" for fn, _ in files):
+        bad_names = ", ".join(fn for fn, _ in files[:6]) or "(aucun fichier)"
+        apk_fix_p = (
+            f"Tu as ecrit ces fichiers : {bad_names} — c'est INTERDIT pour cette demande "
+            f"(pas de Kivy/Buildozer/Kotlin/Java, le pipeline ne peut PAS les compiler). "
+            f"Reponds UNIQUEMENT avec index.html (+ style.css/main.js si besoin), interface "
+            f"mobile complete pour : {prompt[:400]}\n"
+            f"Format strict:\n###FILE: index.html\n<code>\n###ENDFILE"
+        )
+        await websocket.send_json({"type":"agent_start","agent":agent_name})
+        apk_fix_resp = await stream_agent(websocket, agent_name, apk_fix_p, coder_system_dyn, cancel_event=cancel_event)
+        apk_fixed = extract_files(apk_fix_resp)
+        if any(fn.lower() == "index.html" for fn, _ in apk_fixed):
+            files = apk_fixed
+            code_resp = apk_fix_resp
+
     run_ok = None
     # Telemetrie du run (une ligne JSONL en fin de pipeline -> /pipeline_stats). Permet de
     # connaitre le taux de reussite reel EN PROD sans rejouer le banc de 60 tests.
@@ -2111,166 +2229,180 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
             if fixed:
                 await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, fixed)
 
-        # Deduire requirements.txt des imports (le modele l'oublie souvent) AVANT l'install
-        added_deps = await asyncio.get_event_loop().run_in_executor(None, derive_requirements, project_dir)
-        if added_deps:
-            await websocket.send_json({"type":"file_created",
-                "name":f"requirements.txt (+{len(added_deps)} dépendance(s) déduite(s): {', '.join(added_deps[:6])})","size":""})
-        # Equivalent Node.js : deduire package.json des require()/import (meme raison : le
-        # modele utilise souvent axios/node-fetch/etc. sans jamais creer package.json).
-        added_node_deps = await asyncio.get_event_loop().run_in_executor(None, derive_node_requirements, project_dir)
-        if added_node_deps:
-            await websocket.send_json({"type":"file_created",
-                "name":f"package.json (+{len(added_node_deps)} dépendance(s) déduite(s): {', '.join(added_node_deps[:6])})","size":""})
-        # Installer les dépendances
-        ok_dep, _ = await asyncio.get_event_loop().run_in_executor(None, install_deps, project_dir)
-
-        if cancel_event.is_set():
-            await websocket.send_json({"type":"done"}); return
-
-        # ── Garde-fou : bloquer le code destructeur AVANT exécution ──
-        all_code = "\n".join(c for _, c in files)
-        safe, danger_reasons = safety_check(all_code)
-        if not safe:
-            await websocket.send_json({
-                "type":"blocked",
-                "reasons":danger_reasons
-            })
-            run_ok, run_out, entry = None, "Exécution bloquée par sécurité", None
-        else:
-            # ── Phase 5 : Exécuter ────────────────────────────────────
-            run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
-                None, execute_project, project_dir
-            )
-
-        if run_ok is not None:
+        # ── Application Android (APK) : detecte via mots-cles dans le prompt ──
+        # Contourne TOUT le flux Python (deps/execution/auto-correction) : le contenu
+        # genere est du HTML/CSS/JS (meme convention que "site web statique" dans
+        # CODER_SYSTEM), injecte dans le squelette Android WebView puis compile via
+        # Gradle (cf. build_android_apk). Voir memoire "devllma-android-apk".
+        if wants_android_apk(prompt):
+            apk_ok, apk_msg, apk_path = await asyncio.get_event_loop().run_in_executor(
+                None, build_android_apk, project_dir, files)
+            run_ok, run_out, entry = apk_ok, apk_msg, (os.path.basename(apk_path) if apk_path else None)
             await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
+            if apk_ok:
+                await websocket.send_json({"type":"file_created","name":os.path.basename(apk_path),"size":""})
+            # Le commit git automatique (si run_ok) est gere plus bas, commun aux 2 branches.
+        else:
+            # Deduire requirements.txt des imports (le modele l'oublie souvent) AVANT l'install
+            added_deps = await asyncio.get_event_loop().run_in_executor(None, derive_requirements, project_dir)
+            if added_deps:
+                await websocket.send_json({"type":"file_created",
+                    "name":f"requirements.txt (+{len(added_deps)} dépendance(s) déduite(s): {', '.join(added_deps[:6])})","size":""})
+            # Equivalent Node.js : deduire package.json des require()/import (meme raison : le
+            # modele utilise souvent axios/node-fetch/etc. sans jamais creer package.json).
+            added_node_deps = await asyncio.get_event_loop().run_in_executor(None, derive_node_requirements, project_dir)
+            if added_node_deps:
+                await websocket.send_json({"type":"file_created",
+                    "name":f"package.json (+{len(added_node_deps)} dépendance(s) déduite(s): {', '.join(added_node_deps[:6])})","size":""})
+            # Installer les dépendances
+            ok_dep, _ = await asyncio.get_event_loop().run_in_executor(None, install_deps, project_dir)
 
-            # ── Phase 6 : Boucle de correction auto ───────────────────
-            if not run_ok:
-                prev_err = None
-                stuck = 0
-                initial_error = run_out
-                last_fix_summary = ""
-                for iteration in range(1, 4):
-                    if cancel_event.is_set():
-                        break
-                    _telemetry["iterations"] = iteration
-                    await websocket.send_json({"type":"iter_start","n":iteration})
+            if cancel_event.is_set():
+                await websocket.send_json({"type":"done"}); return
 
-                    # Detection de blocage : si la MEME erreur persiste malgre la correction
-                    # precedente, le modele tourne en rond -> on escalade (temperature plus
-                    # haute + consigne explicite de changer d'approche) au lieu de reessayer
-                    # a l'identique indefiniment (cf. logique deja presente dans dev_agent.py).
-                    cur_files = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
-                    clean_err = extract_error_line(run_out)
-                    stuck = stuck + 1 if clean_err == prev_err else 0
-                    prev_err = clean_err
-                    escalate = stuck >= 1
-                    fix_temp = 0.2 if not escalate else min(0.7, 0.3 + 0.15 * stuck)
-                    escalate_note = (
-                        "\nATTENTION: cette erreur PERSISTE malgre ta correction precedente. "
-                        "Change d'APPROCHE sur la cause de l'erreur (corrige ou remplace la ligne "
-                        "fautive par une autre methode) — NE RECOPIE PAS LE MEME CODE. "
-                        "Conserve toute la logique/fonctionnalites qui marchent deja."
-                    ) if escalate else ""
+            # ── Garde-fou : bloquer le code destructeur AVANT exécution ──
+            all_code = "\n".join(c for _, c in files)
+            safe, danger_reasons = safety_check(all_code)
+            if not safe:
+                await websocket.send_json({
+                    "type":"blocked",
+                    "reasons":danger_reasons
+                })
+                run_ok, run_out, entry = None, "Exécution bloquée par sécurité", None
+            else:
+                # ── Phase 5 : Exécuter ────────────────────────────────────
+                run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
+                    None, execute_project, project_dir
+                )
 
-                    # Brain analyse UNIQUEMENT quand on est bloque (meme erreur qui persiste).
-                    # Tant que l'erreur CHANGE (le modele progresse), on saute cette passe :
-                    # brain et coder sont le MEME modele 30b -> l'analyse re-evalue tout le
-                    # contexte (trace + code) que le coder re-evalue juste apres -> prompt-eval
-                    # double pour rien sur ce CPU. On ne paie l'analyse que si on tourne en rond.
-                    analysis = ""
-                    if escalate:
-                        err_ctx = (f"ERREUR PRECISE: {clean_err}\n\nTRACE COMPLETE:\n{run_out}\n\n"
-                                   f"CODE:\n{format_context(cur_files)}\n\n"
-                                   f"Identifie la cause racine EXACTE et dis exactement quoi corriger.{escalate_note}")
-                        analysis = await asyncio.get_event_loop().run_in_executor(
-                            None, call_brain, err_ctx, BRAIN_FIX_SYSTEM, 400
-                        )
+            if run_ok is not None:
+                await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
+
+                # ── Phase 6 : Boucle de correction auto ───────────────────
+                if not run_ok:
+                    prev_err = None
+                    stuck = 0
+                    initial_error = run_out
+                    last_fix_summary = ""
+                    for iteration in range(1, 4):
                         if cancel_event.is_set():
                             break
-                        await websocket.send_json({"type":"agent_start","agent":"brain"})
-                        await websocket.send_json({"type":"brain_think","text":analysis})
+                        _telemetry["iterations"] = iteration
+                        await websocket.send_json({"type":"iter_start","n":iteration})
 
-                    # ── Auto-debug web (rail Capacites) : quand on est BLOQUE sur la meme
-                    # erreur et que la capacite est active, on recherche l'erreur sur le web
-                    # (DuckDuckGo, gratuit) et on injecte des pistes dans le prompt de
-                    # correction. Gate sur escalate uniquement -> aucun cout tant que le
-                    # modele progresse tout seul.
-                    web_note = ""
-                    if escalate and cfg_on("autodebug"):
-                        try:
-                            q = ((clean_err or "")[:120] + " python").strip()
-                            hits = await asyncio.get_event_loop().run_in_executor(
-                                None, lambda: _web_search(q, 3))
-                            good = [h for h in (hits or []) if h.get("url") and h.get("snippet")]
-                            if good:
-                                web_note = ("PISTES WEB (recherche sur l'erreur — inspire-toi de la "
-                                            "cause, ne copie pas aveuglement) :\n"
-                                            + "\n".join(f"- {(h.get('title') or '')[:80]} : "
-                                                        f"{(h.get('snippet') or '')[:160]}" for h in good[:3])
-                                            + "\n\n")
-                                await websocket.send_json({"type":"agent_start","agent":"researcher"})
-                                await websocket.send_json({"type":"brain_think",
-                                    "text":"\U0001F50E Recherche web sur l'erreur : "+q+"\n"+web_note})
-                        except Exception:
-                            pass
+                        # Detection de blocage : si la MEME erreur persiste malgre la correction
+                        # precedente, le modele tourne en rond -> on escalade (temperature plus
+                        # haute + consigne explicite de changer d'approche) au lieu de reessayer
+                        # a l'identique indefiniment (cf. logique deja presente dans dev_agent.py).
+                        cur_files = await asyncio.get_event_loop().run_in_executor(None, read_project, project_dir)
+                        clean_err = extract_error_line(run_out)
+                        stuck = stuck + 1 if clean_err == prev_err else 0
+                        prev_err = clean_err
+                        escalate = stuck >= 1
+                        fix_temp = 0.2 if not escalate else min(0.7, 0.3 + 0.15 * stuck)
+                        escalate_note = (
+                            "\nATTENTION: cette erreur PERSISTE malgre ta correction precedente. "
+                            "Change d'APPROCHE sur la cause de l'erreur (corrige ou remplace la ligne "
+                            "fautive par une autre methode) — NE RECOPIE PAS LE MEME CODE. "
+                            "Conserve toute la logique/fonctionnalites qui marchent deja."
+                        ) if escalate else ""
 
-                    # Agent corrige (n'injecte la section ANALYSE que si le brain a tourne)
-                    analyse_note = f"ANALYSE:\n{analysis}\n\n" if analysis else ""
-                    fix_p = (f"ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
-                             f"{web_note}{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
-                             f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
-                             f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
-                    # Bloqué (escalate) OU deja en mode Colab -> on delegue la correction au GPU.
-                    fix_resp = await _gen_code(websocket, agent_name, fix_p, coder_fix_system_dyn,
-                                               cancel_event, temperature=fix_temp,
-                                               via_colab=(escalate or big_project))
-                    if cancel_event.is_set():
-                        break
+                        # Brain analyse UNIQUEMENT quand on est bloque (meme erreur qui persiste).
+                        # Tant que l'erreur CHANGE (le modele progresse), on saute cette passe :
+                        # brain et coder sont le MEME modele 30b -> l'analyse re-evalue tout le
+                        # contexte (trace + code) que le coder re-evalue juste apres -> prompt-eval
+                        # double pour rien sur ce CPU. On ne paie l'analyse que si on tourne en rond.
+                        analysis = ""
+                        if escalate:
+                            err_ctx = (f"ERREUR PRECISE: {clean_err}\n\nTRACE COMPLETE:\n{run_out}\n\n"
+                                       f"CODE:\n{format_context(cur_files)}\n\n"
+                                       f"Identifie la cause racine EXACTE et dis exactement quoi corriger.{escalate_note}")
+                            analysis = await asyncio.get_event_loop().run_in_executor(
+                                None, call_brain, err_ctx, BRAIN_FIX_SYSTEM, 400
+                            )
+                            if cancel_event.is_set():
+                                break
+                            await websocket.send_json({"type":"agent_start","agent":"brain"})
+                            await websocket.send_json({"type":"brain_think","text":analysis})
 
-                    fixed = extract_files(fix_resp)
-                    # Garde-fou anti-regression : rejeter une "correction" qui vide un fichier
-                    # qui avait deja du contenu substantiel (sinon une correction ratee peut
-                    # ecraser un fichier fonctionnel par un fichier quasi-vide).
-                    applied = []
-                    for fname, code in fixed:
-                        old = cur_files.get(fname, "")
-                        if old and len(old) > 200 and len(code) < 0.4 * len(old):
-                            continue
-                        applied.append((fname, code))
-                    if applied:
-                        await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, applied)
-                        last_fix_summary = "\n".join(f"### {fname}\n{code[:600]}" for fname, code in applied)
+                        # ── Auto-debug web (rail Capacites) : quand on est BLOQUE sur la meme
+                        # erreur et que la capacite est active, on recherche l'erreur sur le web
+                        # (DuckDuckGo, gratuit) et on injecte des pistes dans le prompt de
+                        # correction. Gate sur escalate uniquement -> aucun cout tant que le
+                        # modele progresse tout seul.
+                        web_note = ""
+                        if escalate and cfg_on("autodebug"):
+                            try:
+                                q = ((clean_err or "")[:120] + " python").strip()
+                                hits = await asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: _web_search(q, 3))
+                                good = [h for h in (hits or []) if h.get("url") and h.get("snippet")]
+                                if good:
+                                    web_note = ("PISTES WEB (recherche sur l'erreur — inspire-toi de la "
+                                                "cause, ne copie pas aveuglement) :\n"
+                                                + "\n".join(f"- {(h.get('title') or '')[:80]} : "
+                                                            f"{(h.get('snippet') or '')[:160]}" for h in good[:3])
+                                                + "\n\n")
+                                    await websocket.send_json({"type":"agent_start","agent":"researcher"})
+                                    await websocket.send_json({"type":"brain_think",
+                                        "text":"\U0001F50E Recherche web sur l'erreur : "+q+"\n"+web_note})
+                            except Exception:
+                                pass
 
-                    # Re-validation STATIQUE avant de relancer (bien moins cher qu'un cycle
-                    # install+execute) : une "correction" peut reintroduire une collision de
-                    # nom, casser un import, ou laisser un nom non defini. Si un defaut statique
-                    # subsiste, on saute l'execution et on renvoie ces messages a l'iteration
-                    # suivante pour reparer directement — sans gaspiller un run complet.
-                    stat2 = await asyncio.get_event_loop().run_in_executor(None, syntax_check, project_dir)
-                    if not stat2:
-                        stat2 = await asyncio.get_event_loop().run_in_executor(None, static_self_check, project_dir)
-                    if not stat2:
-                        stat2 = await asyncio.get_event_loop().run_in_executor(None, lint_check, project_dir)
-                    if stat2:
-                        run_ok, run_out = False, ("Defaut statique persistant apres correction :\n" + "\n".join(stat2[:8]))
-                        entry = None
+                        # Agent corrige (n'injecte la section ANALYSE que si le brain a tourne)
+                        analyse_note = f"ANALYSE:\n{analysis}\n\n" if analysis else ""
+                        fix_p = (f"ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
+                                 f"{web_note}{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
+                                 f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
+                                 f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
+                        # Bloqué (escalate) OU deja en mode Colab -> on delegue la correction au GPU.
+                        fix_resp = await _gen_code(websocket, agent_name, fix_p, coder_fix_system_dyn,
+                                                   cancel_event, temperature=fix_temp,
+                                                   via_colab=(escalate or big_project))
+                        if cancel_event.is_set():
+                            break
+
+                        fixed = extract_files(fix_resp)
+                        # Garde-fou anti-regression : rejeter une "correction" qui vide un fichier
+                        # qui avait deja du contenu substantiel (sinon une correction ratee peut
+                        # ecraser un fichier fonctionnel par un fichier quasi-vide).
+                        applied = []
+                        for fname, code in fixed:
+                            old = cur_files.get(fname, "")
+                            if old and len(old) > 200 and len(code) < 0.4 * len(old):
+                                continue
+                            applied.append((fname, code))
+                        if applied:
+                            await asyncio.get_event_loop().run_in_executor(None, write_files, project_dir, applied)
+                            last_fix_summary = "\n".join(f"### {fname}\n{code[:600]}" for fname, code in applied)
+
+                        # Re-validation STATIQUE avant de relancer (bien moins cher qu'un cycle
+                        # install+execute) : une "correction" peut reintroduire une collision de
+                        # nom, casser un import, ou laisser un nom non defini. Si un defaut statique
+                        # subsiste, on saute l'execution et on renvoie ces messages a l'iteration
+                        # suivante pour reparer directement — sans gaspiller un run complet.
+                        stat2 = await asyncio.get_event_loop().run_in_executor(None, syntax_check, project_dir)
+                        if not stat2:
+                            stat2 = await asyncio.get_event_loop().run_in_executor(None, static_self_check, project_dir)
+                        if not stat2:
+                            stat2 = await asyncio.get_event_loop().run_in_executor(None, lint_check, project_dir)
+                        if stat2:
+                            run_ok, run_out = False, ("Defaut statique persistant apres correction :\n" + "\n".join(stat2[:8]))
+                            entry = None
+                            await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
+                            continue  # compte comme une iteration : la boucle ne peut pas tourner a l'infini
+
+                        run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
+                            None, execute_project, project_dir
+                        )
                         await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
-                        continue  # compte comme une iteration : la boucle ne peut pas tourner a l'infini
+                        if run_ok: break
 
-                    run_ok, run_out, entry = await asyncio.get_event_loop().run_in_executor(
-                        None, execute_project, project_dir
-                    )
-                    await websocket.send_json({"type":"run_result","ok":run_ok,"output":run_out,"entry":entry})
-                    if run_ok: break
-
-                # Auto-apprentissage (fire-and-forget, jamais awaite : ne doit pas retarder
-                # la reponse). Distille ce cycle echec+correction en une regle generale et
-                # l'indexe pour les PROCHAINS projets (cf. record_lesson plus haut).
-                asyncio.get_event_loop().run_in_executor(
-                    None, _record_lesson_tracked, initial_error, last_fix_summary, run_ok, run_out)
+                    # Auto-apprentissage (fire-and-forget, jamais awaite : ne doit pas retarder
+                    # la reponse). Distille ce cycle echec+correction en une regle generale et
+                    # l'indexe pour les PROCHAINS projets (cf. record_lesson plus haut).
+                    asyncio.get_event_loop().run_in_executor(
+                        None, _record_lesson_tracked, initial_error, last_fix_summary, run_ok, run_out)
 
         # Commit git automatique d'une version qui marche (point de restauration)
         if run_ok:

@@ -63,3 +63,12 @@ eval_results.json
 
 # Sortie regenerable du banc de tests Colab (artefact, pas source)
 colab_60_results.json
+
+# Artefacts de build Android (template) : caches Gradle, sorties compilees, chemin SDK local
+templates/android_webview/.gradle/
+templates/android_webview/app/build/
+templates/android_webview/local.properties
+*.apk
+
+# Resultats de lots de tests (regenerables, pas le moteur)
+*_results.json
