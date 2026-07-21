@@ -310,7 +310,14 @@ RÈGLES ABSOLUES:
   fonction, DOIT etre effectivement UTILISE dans la logique qui suit, pas seulement lu/stocke dans
   une variable. Avant de finir un fichier, pour chaque parametre/option ajoute, verifie qu'il
   influence reellement au moins une commande/decision/calcul en aval — sinon retire-le ou branche-le
-  correctement."""
+  correctement.
+- Bash/tar : `tar` N'A PAS d'option `--level` pour le niveau de compression gzip (constate : tar
+  l'accepte SANS ERREUR mais l'ignore silencieusement avec l'avertissement "--level is meaningless
+  without --listed-incremental" — l'archive est creee avec la compression PAR DEFAUT, le niveau
+  demande par l'utilisateur n'a AUCUN effet, et le script rapporte quand meme "succes"). Pour un
+  niveau de compression gzip configurable avec tar, utilise soit la variable d'environnement
+  `GZIP=-N tar -czf archive.tar.gz dossier/` (N = niveau, AVANT la commande tar), soit un pipe
+  explicite `tar -cf - dossier/ | gzip -N > archive.tar.gz`."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
@@ -477,10 +484,35 @@ def _sanitize_filename(fname):
     fname = re.sub(r'\.devllma_tmp$', '', fname, flags=re.IGNORECASE)
     return fname
 
+_SHEBANG_EXT = {"bash": ".sh", "sh": ".sh", "zsh": ".sh",
+                "python": ".py", "python3": ".py", "python2": ".py",
+                "node": ".js", "nodejs": ".js",
+                "pwsh": ".ps1"}
+_SHEBANG_RE = re.compile(r'^#!\s*\S*/(?:env\s+)?(\w+)')
+
+def _infer_missing_extension(fname, code):
+    """Si le modele ecrit un nom de fichier SANS AUCUNE extension (constate : ###FILE:
+    script_bash_qui_compresse — confusion avec le nom du DOSSIER projet vu dans le prompt enrichi
+    'Projet: C:\\Devllma\\workspace\\script_bash_qui_compresse\\', reutilise par erreur comme nom de
+    fichier), deduit l'extension depuis la ligne shebang (#!/bin/bash, #!/usr/bin/env python3...)
+    si presente. Sans ca : find_entry_point() ne reconnait aucune extension -> AUCUN point d'entree
+    trouve -> echec SILENCIEUX (meme famille que _single_script_entry, mais pour un nom SANS
+    extension du tout plutot qu'un nom descriptif avec la bonne extension)."""
+    if os.path.splitext(fname)[1]:
+        return fname
+    first_line = (code or "").splitlines()[0] if code else ""
+    m = _SHEBANG_RE.match(first_line)
+    if m:
+        ext = _SHEBANG_EXT.get(m.group(1).lower())
+        if ext:
+            return fname + ext
+    return fname
+
 def write_files(project_dir, files):
     os.makedirs(project_dir, exist_ok=True)
     created = []
     for fname, code in files:
+        fname = _infer_missing_extension(fname, code)
         fname = _sanitize_filename(fname)
         fpath = os.path.join(project_dir, fname.replace("/", os.sep))
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
