@@ -302,7 +302,15 @@ RÈGLES ABSOLUES:
   verifie qu'AUCUN nom de fonction/parametre/variable local ne reutilise le nom d'une fonction
   importee qu'il appelle par ailleurs. Si besoin, renomme le local (ex: suffixe _route, _flag,
   ou prefixe route_/do_) ou importe le module entier ("import crud"/"import link_checker") et
-  appelle-le via crud.xxx()/link_checker.xxx()."""
+  appelle-le via crud.xxx()/link_checker.xxx().
+- RÈGLE CRITIQUE (parametre/option declare mais jamais utilise — constate : un script de sauvegarde
+  Bash acceptait --level <niveau> et le stockait dans une variable, mais la commande tar qui cree
+  l'archive n'utilisait JAMAIS cette variable -> l'option semblait fonctionner cote CLI mais n'avait
+  AUCUN effet reel). Toute option de ligne de commande (argparse/click/param CLI), tout parametre de
+  fonction, DOIT etre effectivement UTILISE dans la logique qui suit, pas seulement lu/stocke dans
+  une variable. Avant de finir un fichier, pour chaque parametre/option ajoute, verifie qu'il
+  influence reellement au moins une commande/decision/calcul en aval — sinon retire-le ou branche-le
+  correctement."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
