@@ -789,6 +789,26 @@ def _main_block_entry(dir_path):
         return entry_candidates[0]
     return None
 
+_SCRIPT_EXTS = (".sh", ".ps1", ".js", ".mjs", ".cjs", ".go")
+
+def _single_script_entry(dir_path):
+    """Repli pour Bash/PowerShell/JS/Go (equivalent non-Python de _main_block_entry) : si UN
+    SEUL fichier de script existe dans ce dossier, c'est forcement lui le point d'entree —
+    meme s'il ne porte pas un des noms conventionnels de ENTRY_POINTS. Sans ca, un script
+    nomme de facon descriptive (ex: rotation_logs.sh au lieu de main.sh/script.sh/run.sh/
+    backup.sh) faisait echouer find_entry_point() completement -> execute_project() ne
+    trouvait AUCUN point d'entree, run_ok restait None, et AUCUN message run_result n'etait
+    jamais envoye au client (echec totalement SILENCIEUX, constate : projet 'rotation_logs.sh'
+    au code pourtant correct, jamais execute ni valide)."""
+    try:
+        candidates = [f for f in sorted(os.listdir(dir_path))
+                      if os.path.splitext(f)[1].lower() in _SCRIPT_EXTS
+                      and not f.startswith("_")
+                      and os.path.isfile(os.path.join(dir_path, f))]
+    except Exception:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
 def find_entry_point(project_dir):
     """Cherche un point d'entree a la racine, PUIS dans un sous-dossier direct
     (layout package Python du type monpaquet/main.py). Sans ce fallback, un projet
@@ -807,7 +827,9 @@ def find_entry_point(project_dir):
     # a la racine), ou plusieurs fichiers .py sans nom standard -> on identifie le point
     # d'entree reel comme celui qui contient un bloc `if __name__ == "__main__"` (constate,
     # data_05 : le modele a produit des modules sans main.py -> projet jamais execute).
-    root_entry = _main_block_entry(project_dir)
+    # Meme idee pour Bash/PowerShell/JS/Go via _single_script_entry (pas de bloc __main__
+    # dans ces langages, mais un seul fichier de script = sans ambiguite le point d'entree).
+    root_entry = _main_block_entry(project_dir) or _single_script_entry(project_dir)
     if root_entry:
         return root_entry
     # Meme repli, mais DANS un sous-dossier (layout package avec noms non standards, ex:
@@ -816,7 +838,8 @@ def find_entry_point(project_dir):
     # indefiniment (constate, script_python_sauvegar_compression : entree reelle = cli.py
     # dans un sous-dossier, aucun fichier racine, donc find_entry_point rendait None).
     for entry in subdirs:
-        sub_entry = _main_block_entry(os.path.join(project_dir, entry))
+        sub = os.path.join(project_dir, entry)
+        sub_entry = _main_block_entry(sub) or _single_script_entry(sub)
         if sub_entry:
             return os.path.join(entry, sub_entry)
     return None
@@ -1118,7 +1141,8 @@ _STRONG_DEV_RE = re.compile(
     r'\b(api|application|app|site|projet|programme|logiciel|jeu|jeux|quiz|bot|fonction|classe|serveur|'
     r'backend|frontend|base de donnees|interface|dashboard|tableau de bord|'
     r'outil|ligne de commande|\bcli\b|'
-    r'python|javascript|typescript|\bjs\b|\bjava\b|react|vue|angular|node|flask|fastapi|django|html|css)\b')
+    r'python|javascript|typescript|\bjs\b|\bjava\b|react|vue|angular|node|flask|fastapi|django|html|css|'
+    r'bash|powershell|\bgo\b)\b')
 # Ajoute "outil"/"ligne de commande"/"cli" PUIS les noms de langage/framework + "quiz"/"jeux"
 # (constate, banc de tests, 2 categories touchees) : un projet de dev qui MANIPULE des
 # fichiers (CLI d'organisation de fichiers ; quiz qui sauvegarde les scores "en fichier")
@@ -1127,6 +1151,14 @@ _STRONG_DEV_RE = re.compile(
 # vers l'agent generaliste au lieu du pipeline de dev. Un nom de LANGAGE (python, js...) est
 # un signal de dev en beton : "un quiz EN PYTHON qui sauvegarde les scores en fichier" doit
 # aller au pipeline. NB : "script python" retire car "python" seul le couvre desormais.
+# Ajoute bash/powershell/go (constate : un script Bash/PowerShell de rotation de logs ou de
+# rapport disque mentionne quasi TOUJOURS "fichier"/"dossier" — c'est son metier — mais
+# aucun de ces 3 langages n'etait dans la liste, donc AUCUN mot-cle de langage ne matchait
+# jamais -> is_file_or_doc_action() renvoyait a tort True, et la demande partait vers l'agent
+# generaliste (write_file direct, SANS execution/validation/auto-correction) au lieu du
+# pipeline CODER durci. Repere en testant le pipeline Go/PowerShell/Bash de bout en bout :
+# les MEMES prompts avec "programme" au lieu de "script" (qui matche deja "programme")
+# passaient bien par le pipeline, ce qui masquait le trou pour "script" seul.
 
 def is_file_or_doc_action(prompt):
     """Vrai si la demande vise un FICHIER/DOCUMENT ponctuel (dossier, note, Word/Excel/PDF...)
@@ -2191,15 +2223,38 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                   "files_written": len(files), "big_project": bool(big_project),
                   "colab": bool(big_project and mem_get("colab_url")), "iterations": 0}
     if not files and code_resp and code_resp.strip():
-        # Constate (projet "api_04") : le codeur a repondu (souvent une reponse
-        # tronquee/incomplete) mais AUCUN fichier n'a pu en etre extrait -> jusqu'ici
-        # le pipeline se terminait en silence, sans que l'utilisateur sache que rien
-        # n'a ete ecrit. On le rend visible explicitement.
-        await websocket.send_json({
-            "type": "token",
-            "text": "\n⚠ Aucun fichier n'a pu être extrait de la réponse du codeur "
-                    "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
-        })
+        # Retry cible : le codeur a REPONDU (souvent une narration/mode d'emploi — constate a
+        # plusieurs reprises sur des scripts PowerShell/Bash, ex: "J'ai cree le script...
+        # Pour l'utiliser : chmod +x...") mais SANS AUCUN bloc ###FILE exploitable -> AUCUN
+        # fichier ecrit, meme avec la regle anti-narration deja presente dans CODER_SYSTEM.
+        # Meme remede que pour la derive Kivy/Buildozer (Android) et la derive de langage
+        # (Go) : citer LA PREUVE concrete (le debut de sa propre reponse fautive) plutot qu'un
+        # rappel abstrait suffit generalement a corriger le cap en un seul essai.
+        narration_fix_p = (
+            f"Ta reponse precedente etait UNIQUEMENT du texte explicatif (\"{code_resp.strip()[:150]}\"), "
+            f"SANS AUCUN bloc ###FILE -> AUCUN fichier n'a ete ecrit. Ne decris JAMAIS ce que tu vas "
+            f"faire ou comment l'utiliser : ta toute premiere ligne DOIT etre '###FILE: nom'. Reponds "
+            f"MAINTENANT avec le code complet pour : {prompt[:400]}\n"
+            f"Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE"
+        )
+        await websocket.send_json({"type":"agent_start","agent":agent_name})
+        narration_fix_resp = await stream_agent(websocket, agent_name, narration_fix_p,
+                                                 coder_system_dyn, cancel_event=cancel_event)
+        narration_fixed = extract_files(narration_fix_resp)
+        if narration_fixed:
+            files = narration_fixed
+            code_resp = narration_fix_resp
+            _telemetry["files_written"] = len(files)
+        else:
+            # Constate (projet "api_04") : le codeur a repondu (souvent une reponse
+            # tronquee/incomplete) mais AUCUN fichier n'a pu en etre extrait -> jusqu'ici
+            # le pipeline se terminait en silence, sans que l'utilisateur sache que rien
+            # n'a ete ecrit. On le rend visible explicitement.
+            await websocket.send_json({
+                "type": "token",
+                "text": "\n⚠ Aucun fichier n'a pu être extrait de la réponse du codeur "
+                        "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
+            })
     if files:
         # Snapshot AVANT d'écraser un projet existant (rollback possible)
         if os.path.isdir(project_dir):
