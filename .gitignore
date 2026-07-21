@@ -72,3 +72,6 @@ templates/android_webview/local.properties
 
 # Resultats de lots de tests (regenerables, pas le moteur)
 *_results.json
+
+# Cache de compilation Go (rechauffe une fois localement, pas du code source)
+.gocache/

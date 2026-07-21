@@ -64,6 +64,13 @@ NODE_EXE       = r"C:\Program Files\nodejs\node.exe"
 NPM_CMD        = r"C:\Program Files\nodejs\npm.cmd"
 BASH_EXE       = r"C:\Program Files\Git\usr\bin\bash.exe"
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+GO_EXE         = r"C:\Program Files\Go\bin\go.exe"
+# Cache Go dedie, hors profil utilisateur : le service tourne en tache SYSTEM dont le profil
+# (systemprofile) n'est PAS celui deja rechauffe manuellement -> le tout premier "go run" sur ce
+# compte aurait subi le meme cout de compilation a froid (constate : 18s, contre 0.4s une fois le
+# cache chaud) et declenche un faux echec via le timeout. Un chemin fixe partage, rechauffe une
+# fois pour toutes, evite ce piege quel que soit le compte qui execute le service.
+GO_CACHE_DIR   = r"C:\Devllma\.gocache"
 os.makedirs(WORKSPACE, exist_ok=True)
 
 # ─── Mémoire globale du Brain ────────────────────────────────────────────────
@@ -187,8 +194,8 @@ BRAIN_FIX_SYSTEM = """Tu es le BRAIN. Du code vient d'échouer.
 Analyse l'erreur, identifie la cause EXACTE en 2 phrases.
 Dis quel fichier corriger et comment (modification précise)."""
 
-CODER_SYSTEM = """Tu es CODER, expert Python/JS/PowerShell/Bash/web. Tu CODES directement sans questions,
-quel que soit le langage demande (PowerShell et Bash sont des langages a part entiere, traite-les avec
+CODER_SYSTEM = """Tu es CODER, expert Python/JS/PowerShell/Bash/Go/web. Tu CODES directement sans questions,
+quel que soit le langage demande (PowerShell, Bash et Go sont des langages a part entiere, traite-les avec
 le meme serieux que Python/JS — jamais de reponse "explicative" a la place du code).
 ECRIRE du code PowerShell/.ps1 est TOTALEMENT SANS DANGER, exactement comme ecrire du Python ou du JS —
 ce n'est QUE du texte source, personne ne l'execute pendant que tu l'ecris. Ne refuse JAMAIS en pretextant
@@ -218,6 +225,12 @@ RÈGLES ABSOLUES:
 - Site web statique (HTML/CSS/JS, pas de backend demandé) -> produis DIRECTEMENT index.html, style.css, main.js etc.
   EN CLAIR (pas de balises ``` a l'interieur du bloc ###FILE). N'ECRIS JAMAIS de script Python qui genere/ecrit
   ces fichiers a la place — les fichiers eux-memes sont le livrable.
+- Projet Go -> UN SEUL fichier nomme EXACTEMENT "main.go", package main, fonction func main().
+  N'IMPORTE JAMAIS de package tiers (ex: github.com/...) : il n'y a PAS de go.mod dans ce pipeline
+  (execute avec "go run main.go" tel quel) -> tout import hors stdlib echoue immediatement avec
+  "no required module provides package X: go.mod file not found". Utilise UNIQUEMENT la bibliotheque
+  standard (fmt, os, time, net/http, encoding/json, strings, strconv, bufio, errors, sync...), qui
+  couvre deja CLI, fichiers, JSON, et meme un petit serveur HTTP.
 - Projet Python -> produis TOUS les fichiers, main.py (point d'entrée) en PREMIER
 - RÈGLE CRITIQUE: tout module Python importé (ex: import downloader) DOIT avoir son fichier créé (downloader.py)
 - requirements.txt = UNIQUEMENT les packages pip externes (ex: requests). JAMAIS la stdlib (os, sys, time, threading, argparse, json, re, queue...)
@@ -716,13 +729,17 @@ bootstrap_memory()
 ENTRY_POINTS = ["main.py","app.py","run.py","server.py","start.py","index.py",
                 "main.js","app.js","server.js","index.js",
                 "main.ps1","script.ps1","run.ps1","backup.ps1",
-                "main.sh","script.sh","run.sh","backup.sh"]
+                "main.sh","script.sh","run.sh","backup.sh",
+                "main.go"]
 
 def _interpreter_cmd(fpath):
     """Choisit l'interpreteur/executable selon l'extension du point d'entree — le pipeline
     ne generait/executait QUE du Python (execute_project lancait toujours [PYTHON, fpath],
     meme pour un .js/.ps1/.sh correct -> faux echec garanti). Chemins absolus (cf. constantes
-    NODE_EXE/BASH_EXE/POWERSHELL_EXE) : le service tourne en tache SYSTEM, PATH pas fiable."""
+    NODE_EXE/BASH_EXE/POWERSHELL_EXE/GO_EXE) : le service tourne en tache SYSTEM, PATH pas fiable.
+    Go : 'go run <fichier>' compile+execute en une etape (verification suffisante) ; ne gere
+    correctement qu'un programme en UN SEUL fichier .go (limitation connue — un package Go
+    reparti sur plusieurs fichiers necessiterait 'go run .' avec le bon cwd, pas encore cable)."""
     ext = os.path.splitext(fpath)[1].lower()
     if ext in (".js", ".mjs", ".cjs"):
         return [NODE_EXE, fpath]
@@ -730,6 +747,8 @@ def _interpreter_cmd(fpath):
         return [POWERSHELL_EXE, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fpath]
     if ext == ".sh":
         return [BASH_EXE, fpath]
+    if ext == ".go":
+        return [GO_EXE, "run", fpath]
     return [PYTHON, fpath]
 
 _ENTRY_IGNORE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "build", "dist", "tests"}
@@ -933,13 +952,23 @@ def execute_project(project_dir, timeout=15):
     _git_bin = r"C:\Program Files\Git\usr\bin"
     if os.path.isdir(_git_bin) and _git_bin not in child_env.get("PATH", ""):
         child_env["PATH"] = _git_bin + os.pathsep + child_env.get("PATH", "")
+    # Go : GOCACHE par defaut vit sous le profil du compte qui execute go.exe. Le service
+    # tourne en tache SYSTEM -> son propre cache serait vierge et rechargerait TOUT a froid
+    # (constate manuellement : 18s pour un hello-world, contre 0.4s cache chaud) alors que le
+    # code genere est correct -> faux echec garanti sur le timeout par defaut. Un chemin fixe
+    # hors profil (deja rechauffe une fois) elimine ce cout quel que soit le compte executant.
+    is_go = fpath.lower().endswith(".go")
+    if is_go:
+        os.makedirs(GO_CACHE_DIR, exist_ok=True)
+        child_env["GOCACHE"] = GO_CACHE_DIR
+    eff_timeout = 40 if is_go else timeout
     proc = None
     try:
         proc = subprocess.Popen(_interpreter_cmd(fpath), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, cwd=project_dir, encoding="utf-8", errors="replace",
                                 env=child_env)
         try:
-            out, _ = proc.communicate(timeout=timeout)
+            out, _ = proc.communicate(timeout=eff_timeout)
             combined = (out or "").strip()[:800]
             low = combined.lower()
             cli_usage_exit = proc.returncode != 0 and (
@@ -1547,6 +1576,25 @@ _EXE_ENTRIES = ["main.py", "app.py", "cli.py", "run.py", "server.py", "start.py"
 _EXE_IGN_SUB = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".backups",
                 ".ruff_cache", "tests", "build", "dist", "logs"}
 
+def _compile_go_exe(project, d):
+    """Compile un projet Go (main.go a la racine) en .exe natif via 'go build' — pas besoin de
+    PyInstaller ni d'exclusions de libs lourdes : le compilateur Go produit directement un binaire
+    autonome, plus petit et plus fiable qu'un empaquetage PyInstaller. Meme GOCACHE dedie que
+    l'execution (cf. execute_project) pour eviter tout cout de compilation a froid."""
+    os.makedirs(_EXE_OUT, exist_ok=True)
+    exe = os.path.join(_EXE_OUT, project + ".exe")
+    env = dict(os.environ)
+    env["GOCACHE"] = GO_CACHE_DIR
+    try:
+        r = subprocess.run([GO_EXE, "build", "-o", exe, "main.go"], cwd=d,
+                           capture_output=True, text=True, timeout=120,
+                           encoding="utf-8", errors="replace", env=env)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if os.path.exists(exe):
+        return {"ok": True, "path": exe, "mb": round(os.path.getsize(exe) / 1e6, 1)}
+    return {"ok": False, "error": (r.stderr or r.stdout or "echec inconnu")[-300:]}
+
 def _compile_project_exe(project):
     """Compile un projet du workspace en .exe autonome (PyInstaller --onefile), en excluant
     les libs lourdes NON importees (torch/scipy/... -> exe leger). Detecte le point d'entree
@@ -1555,6 +1603,8 @@ def _compile_project_exe(project):
     d = os.path.join(WORKSPACE, project)
     if not os.path.isdir(d):
         return {"ok": False, "error": "projet introuvable dans le workspace"}
+    if os.path.exists(os.path.join(d, "main.go")):
+        return _compile_go_exe(project, d)
     ep = None
     for e in _EXE_ENTRIES:
         if os.path.exists(os.path.join(d, e)):
