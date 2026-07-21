@@ -245,6 +245,12 @@ RÈGLES ABSOLUES:
 - Serveur web (FastAPI/Flask/etc.) -> le fichier principal DOIT se terminer par un bloc
   if __name__ == "__main__": qui lance reellement le serveur (ex: uvicorn.run(app, host="0.0.0.0", port=8000)).
   SANS ce bloc, "python main.py" ne demarre rien et se termine immediatement sans erreur.
+- N'IMPORTE QUEL serveur genere (Python/Node/Go/autre), QUEL QUE SOIT le framework -> N'ECOUTE
+  JAMAIS sur le port 8080, meme si c'est l'exemple le plus courant dans la doc du langage (ex: Go
+  net/http). Le port 8080 est deja occupe par DevLLMA lui-meme -> un serveur genere qui l'utilise
+  est signale a tort comme en echec (le port surveille est exclu par securite, jamais verifie) alors
+  que le code est correct. Utilise 8000 (Python/Go), 3000 (Node) ou tout port libre >1024 different
+  de 8080.
 - SQLite utilise avec FastAPI -> sqlite3.connect(..., check_same_thread=False), sinon erreur
   "SQLite objects created in a thread can only be used in that same thread" des la premiere requete.
 - Toute donnee saisie par l'utilisateur affichee dans du HTML genere en f-string DOIT etre
@@ -827,7 +833,8 @@ def _kill_process_tree(pid):
 
 SERVER_MARKERS = ("uvicorn", "flask", "app.run(", "socketserver", "http.server",
                    "runserver", "waitress", "gunicorn", "websockets.serve",
-                   "express()", "app.listen(", "createserver", "http.createserver")
+                   "express()", "app.listen(", "createserver", "http.createserver",
+                   "listenandserve(")
 
 def _detect_server_port(project_dir):
     """Devine le(s) port(s) qu'un projet serveur va ouvrir en scannant son code.
@@ -839,7 +846,7 @@ def _detect_server_port(project_dir):
     for root, dirs, names in os.walk(project_dir):
         dirs[:] = [d for d in dirs if d not in {"__pycache__",".git","node_modules",".venv","build","dist"}]
         for n in names:
-            if not n.endswith((".py", ".js", ".mjs", ".cjs")):
+            if not n.endswith((".py", ".js", ".mjs", ".cjs", ".go")):
                 continue
             try:
                 content = open(os.path.join(root, n), encoding="utf-8", errors="replace").read()
@@ -853,11 +860,18 @@ def _detect_server_port(project_dir):
                 p = int(m[0] or m[1])
                 if p != 8080 and p not in ports:  # 8080 = PROD, jamais un projet genere
                     ports.append(p)
+            # Go idiomatique : http.ListenAndServe(":8000", ...) — le port est un argument
+            # string ":NNNN", pas un "port=" ni ".listen(" -> les regex ci-dessus le ratent.
+            for p in re.findall(r'ListenAndServe\(\s*"?:(\d{2,5})', content, re.IGNORECASE):
+                p = int(p)
+                if p != 8080 and p not in ports:
+                    ports.append(p)
     # Defauts par framework (le port explicite prime, mais sert de repli s'il manque)
     if frameworks & {"flask", "app.run("} and 5000 not in ports:
         ports.append(5000)
     if frameworks & {"uvicorn", "http.server", "runserver", "waitress", "gunicorn",
-                     "express()", "app.listen(", "createserver", "http.createserver"} and 8000 not in ports:
+                     "express()", "app.listen(", "createserver", "http.createserver",
+                     "listenandserve("} and 8000 not in ports:
         ports.append(8000)
     if is_server and not ports:
         ports.append(8000)
@@ -2401,7 +2415,26 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
 
                         # Agent corrige (n'injecte la section ANALYSE que si le brain a tourne)
                         analyse_note = f"ANALYSE:\n{analysis}\n\n" if analysis else ""
-                        fix_p = (f"ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
+                        # Verrou anti-derive de langage — constate (Go) : sur une correction, le
+                        # modele a parfois REECRIT le projet dans un AUTRE langage (Python) au lieu
+                        # de corriger le code existant, meme avec le vrai code affiche dans CODE
+                        # ACTUEL (meme famille de bug que la derive Kivy/Buildozer sur les demandes
+                        # Android). Rappel explicite + nom de fichier attendu = meme remede efficace.
+                        _lang_lock = ""
+                        if entry:
+                            _eext = os.path.splitext(entry)[1].lower()
+                            _lang_names = {".go": "Go", ".js": "JavaScript/Node.js", ".mjs": "JavaScript/Node.js",
+                                           ".cjs": "JavaScript/Node.js", ".ps1": "PowerShell", ".sh": "Bash"}
+                            if _eext in _lang_names:
+                                _ln = _lang_names[_eext]
+                                _lang_lock = (
+                                    f"RAPPEL CRITIQUE : ce projet est en {_ln} (point d'entree '{entry}'). "
+                                    f"CORRIGE LE CODE {_ln.upper()} EXISTANT ci-dessous, ne bascule JAMAIS "
+                                    f"vers un autre langage (ex: Python) meme si ca semble plus simple — "
+                                    f"changer de langage n'est PAS une correction. Le point d'entree DOIT "
+                                    f"rester exactement '{entry}'.\n\n"
+                                )
+                        fix_p = (f"{_lang_lock}ERREUR PRECISE A CORRIGER: {clean_err}{escalate_note}\n\n"
                                  f"{web_note}{analyse_note}TRACE COMPLETE:\n{run_out}\n\n"
                                  f"CODE ACTUEL:\n{format_context(cur_files)}\n\n"
                                  f"Corrige. Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE")
