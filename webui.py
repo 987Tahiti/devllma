@@ -2347,6 +2347,32 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                 "text": "\n⚠ Aucun fichier n'a pu être extrait de la réponse du codeur "
                         "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
             })
+    # Retry cible : stub generique "Hello World" au lieu d'implementer la demande — constate
+    # a 2 reprises INDEPENDANTES sur Go, prompts completement differents (raccourcisseur d'URL
+    # par hash, conversion binaire/decimal) : le modele abandonne parfois une implementation
+    # moyennement complexe et ecrit un simple programme boilerplate qui affiche juste
+    # "Hello, World!" — satisfait la structure minimale (package main/func main) mais ignore
+    # totalement la demande. Detection ciblee (chaine EXACTE "hello world" + fichier tres court)
+    # pour eviter tout faux positif sur un vrai hello-world demande explicitement. Meme remede
+    # que narration/Kivy/langage : citer la preuve concrete plutot qu'un rappel abstrait.
+    _HELLO_STUB_RE = re.compile(r'hello,?\s*world!?', re.IGNORECASE)
+    if (len(files) == 1 and len(files[0][1].strip()) < 200
+            and _HELLO_STUB_RE.search(files[0][1])):
+        _stub_name, _stub_code = files[0]
+        stub_fix_p = (
+            f"Ta reponse precedente est un simple stub \"Hello World\" generique qui NE REPOND PAS "
+            f"a la demande — tu as ecrit exactement : {_stub_code.strip()[:150]!r}. Implemente "
+            f"REELLEMENT la demande suivante, sans placeholder ni exemple generique : {prompt[:400]}\n"
+            f"Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE"
+        )
+        await websocket.send_json({"type":"agent_start","agent":agent_name})
+        stub_fix_resp = await stream_agent(websocket, agent_name, stub_fix_p, coder_system_dyn, cancel_event=cancel_event)
+        stub_fixed = extract_files(stub_fix_resp)
+        if stub_fixed and not (len(stub_fixed) == 1 and len(stub_fixed[0][1].strip()) < 200
+                                and _HELLO_STUB_RE.search(stub_fixed[0][1])):
+            files = stub_fixed
+            code_resp = stub_fix_resp
+            _telemetry["files_written"] = len(files)
     if files:
         # Snapshot AVANT d'écraser un projet existant (rollback possible)
         if os.path.isdir(project_dir):
