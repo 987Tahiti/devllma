@@ -1008,6 +1008,19 @@ def _http_probe(port):
     return True, root_status
 
 def execute_project(project_dir, timeout=15):
+    # Site web statique (index.html a la racine, AUCUN serveur backend detecte) : le/les
+    # fichier(s) .js associes (script.js/main.js...) sont du code COTE NAVIGATEUR (utilisent
+    # document/window/DOM), jamais un script a executer via node -> execute_project le
+    # lancerait quand meme et provoquerait a coup sur un "ReferenceError: document is not
+    # defined", sur un site par ailleurs parfaitement correct une fois ouvert dans un
+    # navigateur (constate : 2 projets sur 2 dans un meme lot, page_web_htmlcssjs_*). Un site
+    # statique se VERIFIE en l'ouvrant dans un navigateur, pas en executant son JS hors
+    # navigateur. Si un VRAI serveur est detecte (Express/http.createServer/...), on ne
+    # court-circuite rien : le flux normal ci-dessous gere deja ce cas correctement.
+    if os.path.exists(os.path.join(project_dir, "index.html")):
+        is_static_check, _ = _detect_server_port(project_dir)
+        if not is_static_check:
+            return True, "(site web statique — à vérifier en ouvrant index.html dans un navigateur, pas d'exécution JS hors navigateur)", "index.html"
     ep = find_entry_point(project_dir)
     if not ep:
         return None, "Aucun fichier principal trouvé (main.py, app.py…)", None
