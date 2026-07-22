@@ -851,7 +851,13 @@ def _single_script_entry(dir_path):
     backup.sh) faisait echouer find_entry_point() completement -> execute_project() ne
     trouvait AUCUN point d'entree, run_ok restait None, et AUCUN message run_result n'etait
     jamais envoye au client (echec totalement SILENCIEUX, constate : projet 'rotation_logs.sh'
-    au code pourtant correct, jamais execute ni valide)."""
+    au code pourtant correct, jamais execute ni valide).
+    Si PLUSIEURS fichiers de script coexistent (constate : deux projets Bash SANS RAPPORT — liste
+    des ports ecoute + liste des fichiers modifies — regroupes dans le MEME dossier a cause d'un
+    nom de projet generique partage, ex 'script_bash_qui_liste'), on prend le PLUS RECEMMENT
+    MODIFIE : c'est presque toujours celui vise par la demande la plus recente (creation/edition),
+    l'autre etant un residu d'une demande anterieure sans rapport. Repli imparfait mais bien
+    meilleur que l'echec silencieux precedent (aucun des deux n'etait jamais execute/valide)."""
     try:
         candidates = [f for f in sorted(os.listdir(dir_path))
                       if os.path.splitext(f)[1].lower() in _SCRIPT_EXTS
@@ -859,7 +865,11 @@ def _single_script_entry(dir_path):
                       and os.path.isfile(os.path.join(dir_path, f))]
     except Exception:
         return None
-    return candidates[0] if len(candidates) == 1 else None
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return max(candidates, key=lambda f: os.path.getmtime(os.path.join(dir_path, f)))
+    return None
 
 def find_entry_point(project_dir):
     """Cherche un point d'entree a la racine, PUIS dans un sous-dossier direct
