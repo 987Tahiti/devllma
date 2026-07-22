@@ -329,7 +329,13 @@ RÈGLES ABSOLUES:
   fonctionnement / charge systeme / memoire sur Windows, appelle PowerShell DEPUIS le script Bash
   (powershell.exe est bien dans le PATH, lui) : ex. `powershell.exe -Command
   "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"` pour l'heure de demarrage, ou
-  `Get-Counter '\\Processor(_Total)\\% Processor Time'` pour la charge CPU."""
+  `Get-Counter '\\Processor(_Total)\\% Processor Time'` pour la charge CPU.
+- Bash sur Windows : `ps` est une version Cygwin LIMITEE (options : -a/-e/-f/-h/-l/-p/-s/-u/-V/-W
+  UNIQUEMENT — verifie directement), PAS le `ps` GNU/Linux complet. Aucune option `-o`/`--sort`
+  n'existe, et AUCUNE colonne memoire (%mem/RSS) n'est jamais affichee, meme avec `ps aux` (erreur
+  constatee : "ps: unknown option -- o"). Pour lister les processus par consommation memoire sous
+  Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command "Get-Process |
+  Sort-Object WorkingSet -Descending | Select-Object -First 5 Name,WorkingSet"`."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
