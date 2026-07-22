@@ -2370,18 +2370,19 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
             })
     # Retry cible : stub/scaffold generique au lieu d'implementer la demande — constate a
-    # PLUSIEURS reprises INDEPENDANTES sur Go, prompts completement differents et sous DEUX
-    # FORMES DIFFERENTES : (1) un simple "Hello, World!" (raccourcisseur d'URL par hash,
-    # conversion binaire/decimal — 1er essai), (2) un squelette generique fichier+gestion
-    # d'erreur avec un commentaire "// Your code here" (le MEME prompt binaire/decimal, apres
-    # correction automatique — la logique de conversion n'a JAMAIS ete ecrite). Le programme
-    # s'execute proprement (exit 0 ou message d'erreur attendu) donc ok=True, aucun signal
-    # d'echec visible malgre une fonctionnalite jamais implementee. Le commentaire placeholder
-    # ("// Your code here", "// TODO: implement"...) est un signal PLUS fiable et plus general
-    # que "Hello World" seul : aucune implementation reelle ne laisserait ce commentaire, donc
-    # pas de restriction de longueur necessaire pour ce cas (contrairement a "hello world", qui
-    # pourrait apparaitre incidemment dans un commentaire/string d'un programme par ailleurs
-    # complet — d'ou la restriction <200 caracteres qui s'applique SEULEMENT a ce sous-cas).
+    # PLUSIEURS reprises INDEPENDANTES sur Go, prompts completement differents et sous TROIS
+    # FORMES DIFFERENTES : (1) un simple "Hello, World!" court (raccourcisseur d'URL par hash,
+    # conversion binaire/decimal — 1er essai), (2) un squelette fichier+gestion d'erreur avec
+    # un commentaire "// Your code here" (meme prompt binaire/decimal, apres correction
+    # automatique), (3) un serveur HTTP complet dont le handler affiche juste "Hello, World!"
+    # (verification d'un numero de carte par l'algorithme de Luhn — le modele a ecrit tout un
+    # squelette de serveur web au lieu de l'algorithme demande). Le programme s'execute
+    # proprement (exit 0, ou meme "serveur actif" pour le cas 3) donc ok=True, aucun signal
+    # d'echec visible malgre une fonctionnalite jamais implementee. Restriction de longueur
+    # <200 caracteres RETIREE pour "hello world" (initialement pensee pour eviter un faux
+    # positif sur un programme complet mentionnant incidemment "hello world") : le cas 3 prouve
+    # qu'un stub peut etre PADDE avec du code de scaffolding (imports/serveur/timeouts) sans
+    # jamais implementer la logique demandee, restant NETTEMENT au-dessus de 200 caracteres.
     _HELLO_STUB_RE = re.compile(r'hello,?\s*world!?', re.IGNORECASE)
     _PLACEHOLDER_STUB_RE = re.compile(
         r'(?://|#)\s*(?:your|write your|add your|insert your|implement your)\s+(?:code|logic)\s*here|'
@@ -2390,9 +2391,7 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
         if len(fs) != 1:
             return False
         code = fs[0][1]
-        if _PLACEHOLDER_STUB_RE.search(code):
-            return True
-        return len(code.strip()) < 200 and bool(_HELLO_STUB_RE.search(code))
+        return bool(_PLACEHOLDER_STUB_RE.search(code) or _HELLO_STUB_RE.search(code))
     if _is_generic_stub(files):
         _stub_code = files[0][1]
         stub_fix_p = (
