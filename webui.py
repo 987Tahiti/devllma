@@ -1208,6 +1208,11 @@ def _explicit_project_name(text):
         m = re.search(r"[\"«“]([^\"»”\n]{2,40})[\"»”]", text)
     return m.group(1).strip() if m else None
 
+_SLUG_GENERIC_VEHICLE = {"outil","outils","script","scripts","programme","programmes",
+                          "application","applications","logiciel","logiciels","app","utilitaire",
+                          "python","javascript","js","typescript","bash","powershell","ps1",
+                          "go","golang","java","html","css","cli","ligne","commande"}
+
 def slug(text):
     name = _explicit_project_name(text)
     if name:
@@ -1218,7 +1223,18 @@ def slug(text):
     text=re.sub(r"(?:crée|cree|créer|creer|fais|fait|génère|genere|développe|developpe|écris|ecris)\s+","",text.lower())
     text=re.sub(r"(?:moi|un|une|le|la|les|des|du|avec|pour|en|et|ou|de)\s+"," ",text)
     text=re.sub(r"[^\w\s]","",text).strip()
-    return "_".join(text.split()[:4]) or "projet"
+    words = text.split()
+    # Retire les mots "vehicule" generiques (outil/script/langage/CLI) qui rendent le slug
+    # IDENTIQUE pour des demandes totalement DIFFERENTES partageant juste la meme introduction
+    # (ex: "Cree un outil Python en ligne de commande qui X" -> memes 4 premiers mots "outil
+    # python ligne commande" quel que soit X). Constate : 7 projets SANS RAPPORT regroupes dans
+    # un seul dossier ("outil_python_ligne_comman"), au point qu'un run_result d'un VIEUX projet
+    # a valide a tort un NOUVEAU projet sans jamais executer son vrai code (find_entry_point
+    # priorise main.py, deja present de l'ancien projet, avant tout repli). Garde-fou : si le
+    # filtrage ne laisse presque rien, revenir aux mots bruts plutot que produire un slug vide.
+    filtered = [w for w in words if w not in _SLUG_GENERIC_VEHICLE]
+    use_words = filtered if len(filtered) >= 3 else words
+    return "_".join(use_words[:4]) or "projet"
 
 def is_edit(prompt):
     low = strip_accents(prompt.lower())
