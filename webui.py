@@ -322,7 +322,14 @@ RÈGLES ABSOLUES:
   (convention POSIX/Linux) est VIDE/non definie ici — constate : un script utilisant
   `"/c/Users/$USER/.ssh"` a produit le chemin casse `/c/Users//.ssh` (double slash, $USER vide) et
   a echoue en pretendant que le dossier n'existe pas. Utilise `$USERNAME` (definie par Windows et
-  heritee par Git Bash) pour recuperer le nom de l'utilisateur courant, jamais `$USER`."""
+  heritee par Git Bash) pour recuperer le nom de l'utilisateur courant, jamais `$USER`.
+- Bash sur Windows (meme environnement) : les commandes Linux `uptime`, `free`, et le systeme de
+  fichiers `/proc` (`/proc/uptime`, `/proc/loadavg`...) N'EXISTENT PAS (constate : "uptime: command
+  not found", verifie qu'aucune n'est installee avec Git Bash sur ce poste). Pour du temps de
+  fonctionnement / charge systeme / memoire sur Windows, appelle PowerShell DEPUIS le script Bash
+  (powershell.exe est bien dans le PATH, lui) : ex. `powershell.exe -Command
+  "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"` pour l'heure de demarrage, ou
+  `Get-Counter '\\Processor(_Total)\\% Processor Time'` pour la charge CPU."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
