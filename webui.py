@@ -2347,29 +2347,43 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                 "text": "\n⚠ Aucun fichier n'a pu être extrait de la réponse du codeur "
                         "(réponse probablement tronquée ou format inattendu). Rien n'a été écrit."
             })
-    # Retry cible : stub generique "Hello World" au lieu d'implementer la demande — constate
-    # a 2 reprises INDEPENDANTES sur Go, prompts completement differents (raccourcisseur d'URL
-    # par hash, conversion binaire/decimal) : le modele abandonne parfois une implementation
-    # moyennement complexe et ecrit un simple programme boilerplate qui affiche juste
-    # "Hello, World!" — satisfait la structure minimale (package main/func main) mais ignore
-    # totalement la demande. Detection ciblee (chaine EXACTE "hello world" + fichier tres court)
-    # pour eviter tout faux positif sur un vrai hello-world demande explicitement. Meme remede
-    # que narration/Kivy/langage : citer la preuve concrete plutot qu'un rappel abstrait.
+    # Retry cible : stub/scaffold generique au lieu d'implementer la demande — constate a
+    # PLUSIEURS reprises INDEPENDANTES sur Go, prompts completement differents et sous DEUX
+    # FORMES DIFFERENTES : (1) un simple "Hello, World!" (raccourcisseur d'URL par hash,
+    # conversion binaire/decimal — 1er essai), (2) un squelette generique fichier+gestion
+    # d'erreur avec un commentaire "// Your code here" (le MEME prompt binaire/decimal, apres
+    # correction automatique — la logique de conversion n'a JAMAIS ete ecrite). Le programme
+    # s'execute proprement (exit 0 ou message d'erreur attendu) donc ok=True, aucun signal
+    # d'echec visible malgre une fonctionnalite jamais implementee. Le commentaire placeholder
+    # ("// Your code here", "// TODO: implement"...) est un signal PLUS fiable et plus general
+    # que "Hello World" seul : aucune implementation reelle ne laisserait ce commentaire, donc
+    # pas de restriction de longueur necessaire pour ce cas (contrairement a "hello world", qui
+    # pourrait apparaitre incidemment dans un commentaire/string d'un programme par ailleurs
+    # complet — d'ou la restriction <200 caracteres qui s'applique SEULEMENT a ce sous-cas).
     _HELLO_STUB_RE = re.compile(r'hello,?\s*world!?', re.IGNORECASE)
-    if (len(files) == 1 and len(files[0][1].strip()) < 200
-            and _HELLO_STUB_RE.search(files[0][1])):
-        _stub_name, _stub_code = files[0]
+    _PLACEHOLDER_STUB_RE = re.compile(
+        r'(?://|#)\s*(?:your|write your|add your|insert your|implement your)\s+(?:code|logic)\s*here|'
+        r'(?://|#)\s*todo:?\s*implement', re.IGNORECASE)
+    def _is_generic_stub(fs):
+        if len(fs) != 1:
+            return False
+        code = fs[0][1]
+        if _PLACEHOLDER_STUB_RE.search(code):
+            return True
+        return len(code.strip()) < 200 and bool(_HELLO_STUB_RE.search(code))
+    if _is_generic_stub(files):
+        _stub_code = files[0][1]
         stub_fix_p = (
-            f"Ta reponse precedente est un simple stub \"Hello World\" generique qui NE REPOND PAS "
-            f"a la demande — tu as ecrit exactement : {_stub_code.strip()[:150]!r}. Implemente "
-            f"REELLEMENT la demande suivante, sans placeholder ni exemple generique : {prompt[:400]}\n"
+            f"Ta reponse precedente est un stub/squelette generique qui NE REPOND PAS a la demande "
+            f"— tu as ecrit exactement : {_stub_code.strip()[:200]!r}. Implemente REELLEMENT la "
+            f"demande suivante, sans placeholder ni commentaire \"TODO\"/\"your code here\" : "
+            f"{prompt[:400]}\n"
             f"Format strict:\n###FILE: nom.ext\n<code>\n###ENDFILE"
         )
         await websocket.send_json({"type":"agent_start","agent":agent_name})
         stub_fix_resp = await stream_agent(websocket, agent_name, stub_fix_p, coder_system_dyn, cancel_event=cancel_event)
         stub_fixed = extract_files(stub_fix_resp)
-        if stub_fixed and not (len(stub_fixed) == 1 and len(stub_fixed[0][1].strip()) < 200
-                                and _HELLO_STUB_RE.search(stub_fixed[0][1])):
+        if stub_fixed and not _is_generic_stub(stub_fixed):
             files = stub_fixed
             code_resp = stub_fix_resp
             _telemetry["files_written"] = len(files)
