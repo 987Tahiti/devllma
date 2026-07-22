@@ -1096,7 +1096,15 @@ def execute_project(project_dir, timeout=15):
                 # Dans les deux cas, on exige l'ABSENCE de toute signature de plantage (Python/JS/
                 # PowerShell/Bash confondus) et une sortie courte -> un vrai crash produit toujours
                 # une trace plus longue et reconnaissable, jamais juste une ligne d'usage propre.
-                or (len(combined) < 300
+                # Seuil releve de 300 a 600 (constate : un CLI a PLUSIEURS options nommees, ex.
+                # -u/-n/-d avec une ligne de description chacune, produit un bloc "usage:" bien
+                # forme mais legitimement >300 caracteres — 498 caracteres mesures sur un script
+                # de healthcheck sain, faux echec garanti par le seuil trop strict). 600 reste tres
+                # en dessous d'une vraie trace d'erreur (Traceback/Exception font typiquement
+                # plusieurs centaines de caracteres PAR frame), donc ne relache pas la detection
+                # de vrais plantages — ceux-ci sont de toute facon deja exclus par la liste de
+                # signatures ci-dessous.
+                or (len(combined) < 600
                     and not re.search(r'traceback|exception|error:.*\bat\b|at Object\.|at Module\.|'
                                       r'\.js:\d+|\.ps1:\d+|line \d+:.*(?:syntax error|command not found)|'
                                       r'referenceerror|typeerror|is not recognized as',
