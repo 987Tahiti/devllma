@@ -2657,10 +2657,24 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                         # Garde-fou anti-regression : rejeter une "correction" qui vide un fichier
                         # qui avait deja du contenu substantiel (sinon une correction ratee peut
                         # ecraser un fichier fonctionnel par un fichier quasi-vide).
+                        # Deuxieme garde-fou (contenu, pas seulement longueur) : constate sur le
+                        # MEME bug de stub que plus haut (Hello World/placeholder) — le premier
+                        # essai avait REELLEMENT implemente la demande (Luhn, imports strconv/
+                        # strings) mais avec un bug de compilation mineur (imports inutilises) ;
+                        # la boucle de correction NORMALE a "corrige" cette erreur en supprimant
+                        # toute la logique reelle, regressant vers un simple stub "Hello, World!"
+                        # -> le garde-fou de LONGUEUR seul ne suffit pas a detecter cette regression
+                        # de CONTENU (le nouveau fichier peut rester au-dessus du seuil de taille
+                        # tout en devenant un stub). On rejette aussi une correction qui introduit
+                        # un motif de stub la ou l'ancien contenu n'en avait pas.
                         applied = []
                         for fname, code in fixed:
                             old = cur_files.get(fname, "")
                             if old and len(old) > 200 and len(code) < 0.4 * len(old):
+                                continue
+                            old_is_stub = bool(_PLACEHOLDER_STUB_RE.search(old) or _HELLO_STUB_RE.search(old))
+                            new_is_stub = bool(_PLACEHOLDER_STUB_RE.search(code) or _HELLO_STUB_RE.search(code))
+                            if old and len(old) > 200 and new_is_stub and not old_is_stub:
                                 continue
                             applied.append((fname, code))
                         if applied:
