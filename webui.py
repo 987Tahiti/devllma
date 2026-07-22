@@ -2672,9 +2672,13 @@ async def handle_prompt(websocket, sid_box, prompt, cancel_event):
                             old = cur_files.get(fname, "")
                             if old and len(old) > 200 and len(code) < 0.4 * len(old):
                                 continue
+                            # Pas de seuil "len(old) > 200" ici (contrairement au garde-fou de
+                            # longueur ci-dessus) : un essai COURT mais REEL (ex: une fonction Luhn
+                            # compacte de 100 caracteres) merite la meme protection qu'un long — la
+                            # regression stub-vs-reel importe independamment de la taille absolue.
                             old_is_stub = bool(_PLACEHOLDER_STUB_RE.search(old) or _HELLO_STUB_RE.search(old))
                             new_is_stub = bool(_PLACEHOLDER_STUB_RE.search(code) or _HELLO_STUB_RE.search(code))
-                            if old and len(old) > 200 and new_is_stub and not old_is_stub:
+                            if old and new_is_stub and not old_is_stub:
                                 continue
                             applied.append((fname, code))
                         if applied:
