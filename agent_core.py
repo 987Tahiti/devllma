@@ -1324,6 +1324,12 @@ Regles :
 - APIs sans cle pour http_request : api.open-meteo.com/v1/forecast?latitude=..&longitude=..&current_weather=true ;
   api.frankfurter.app/latest?from=EUR&to=USD ; fr.wikipedia.org/api/rest_v1/page/summary/<Titre>.
 - Resultat produit (fichier/dossier) -> termine par open_path pour l'ouvrir a l'utilisateur.
+  N'utilise JAMAIS run_powershell pour lancer une application graphique (notepad, mspaint,
+  explorer...) a la place ou en plus de open_path : ce service tourne SANS session Bureau
+  interactive, une appli graphique lancee ainsi ne peut jamais etre fermee -> le process reste
+  bloque jusqu'au timeout (60s) puis survit orpheline indefiniment (constate : notepad.exe reste
+  actif en tache de fond apres un appel run_powershell "notepad fichier.md"). open_path (via
+  os.startfile) est deja non-bloquant et gere ce cas correctement -> un seul appel suffit.
 - Verifie le resultat d'un outil avant d'annoncer un succes. Ne repete jamais un appel identique.
 - Jamais de donnees sensibles (mots de passe, cles) dans memory_save.
 - Reponds concis, en francais.
