@@ -317,7 +317,12 @@ RÈGLES ABSOLUES:
   demande par l'utilisateur n'a AUCUN effet, et le script rapporte quand meme "succes"). Pour un
   niveau de compression gzip configurable avec tar, utilise soit la variable d'environnement
   `GZIP=-N tar -czf archive.tar.gz dossier/` (N = niveau, AVANT la commande tar), soit un pipe
-  explicite `tar -cf - dossier/ | gzip -N > archive.tar.gz`."""
+  explicite `tar -cf - dossier/ | gzip -N > archive.tar.gz`.
+- Bash sur Windows (Git Bash, l'environnement d'execution de ce pipeline) : la variable `$USER`
+  (convention POSIX/Linux) est VIDE/non definie ici — constate : un script utilisant
+  `"/c/Users/$USER/.ssh"` a produit le chemin casse `/c/Users//.ssh` (double slash, $USER vide) et
+  a echoue en pretendant que le dossier n'existe pas. Utilise `$USERNAME` (definie par Windows et
+  heritee par Git Bash) pour recuperer le nom de l'utilisateur courant, jamais `$USER`."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
