@@ -366,7 +366,23 @@ RÈGLES ABSOLUES:
   expose `.Used`/`.Free` (en octets) ; `Get-CimInstance -ClassName Win32_LogicalDisk` expose
   `.Size`/`.FreeSpace` (celui-ci EST correct, mais seulement avec Win32_LogicalDisk, pas Get-Volume).
   Avant d'utiliser une propriete de taille/espace sur un objet PowerShell, verifie qu'elle existe
-  reellement pour CE cmdlet precis (elles ne sont pas interchangeables d'un cmdlet a l'autre)."""
+  reellement pour CE cmdlet precis (elles ne sont pas interchangeables d'un cmdlet a l'autre).
+- RÈGLE CRITIQUE PowerShell (debut de CHAQUE script .ps1) : commence TOUJOURS par
+  `$ErrorActionPreference = 'Stop'`. Sans ca, une erreur de cmdlet (parametre inexistant, cmdlet
+  qui echoue) est NON-BLOQUANTE PAR DEFAUT : le script AFFICHE l'erreur en rouge puis CONTINUE
+  les instructions suivantes, et le process se termine quand meme avec le code de sortie 0 —
+  un vrai bug reste alors invisible pour toute validation basee sur le code de sortie (constate :
+  `Get-NetAdapter -Status Up` — `-Status` N'EXISTE PAS comme parametre de `Get-NetAdapter`, c'est
+  une PROPRIETE de l'objet retourne, pas un filtre du cmdlet — a produit "ParameterBindingException"
+  mais le script a continue et le processus a quand meme quitte avec le code 0). Avec
+  `$ErrorActionPreference = 'Stop'` en tete, la MEME erreur arrete le script et sort avec un code
+  non-nul, rendant le bug detectable. Si une operation peut echouer de façon acceptable/attendue
+  (ex: un fichier illisible parmi plusieurs dans une boucle), entoure UNIQUEMENT cette operation
+  d'un bloc try/catch explicite plutot que de laisser l'erreur se propager. Meme famille que le
+  bug Get-Volume/.FreeSpace ci-dessus : ne confonds JAMAIS une PROPRIETE d'un objet retourne
+  (ex: `.Status`, `.State`) avec un PARAMETRE du cmdlet qui le genere — pour filtrer par une
+  propriete, utilise `Get-X | Where-Object PropertyName -eq valeur`, jamais `Get-X -PropertyName
+  valeur` sauf si tu es certain que ce parametre existe reellement sur CE cmdlet precis."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
