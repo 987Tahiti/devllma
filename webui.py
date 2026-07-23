@@ -976,7 +976,7 @@ def _detect_server_port(project_dir):
     for root, dirs, names in os.walk(project_dir):
         dirs[:] = [d for d in dirs if d not in {"__pycache__",".git","node_modules",".venv","build","dist"}]
         for n in names:
-            if not n.endswith((".py", ".js", ".mjs", ".cjs", ".go")):
+            if not n.endswith((".py", ".js", ".mjs", ".cjs", ".go", ".ps1", ".sh")):
                 continue
             try:
                 content = open(os.path.join(root, n), encoding="utf-8", errors="replace").read()
