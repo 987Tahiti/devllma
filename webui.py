@@ -1249,8 +1249,18 @@ def execute_project(project_dir, timeout=15):
                 # de vrais plantages — ceux-ci sont de toute facon deja exclus par la liste de
                 # signatures ci-dessous.
                 or (len(combined) < 600
+                    # NB : ".ps1:N" (position d'erreur) est volontairement ABSENT de cette liste,
+                    # contrairement a son equivalent Node ".js:N" — en PowerShell, CE motif
+                    # apparait TOUJOURS des qu'une erreur est levee (Write-Error OU vraie exception
+                    # non geree), y compris pour un message d'usage CLI parfaitement intentionnel ;
+                    # contrairement a Node (ou ".js:N" n'apparait que dans une VRAIE stack trace
+                    # d'exception non geree, jamais pour un simple console.error("...") custom),
+                    # il n'a AUCUN pouvoir discriminant en PowerShell (constate : faisait exclure
+                    # a tort un Write-Error intentionnel, meme apres avoir neutralise le motif
+                    # "exception" via low_no_writeerror -- ce motif capturait le meme cas par un
+                    # autre biais).
                     and not re.search(r'traceback|exception|error:.*\bat\b|at Object\.|at Module\.|'
-                                      r'\.js:\d+|\.ps1:\d+|line \d+:.*(?:syntax error|command not found)|'
+                                      r'\.js:\d+|line \d+:.*(?:syntax error|command not found)|'
                                       r'referenceerror|typeerror|is not recognized as',
                                       low_no_writeerror)
                     and (
