@@ -1334,16 +1334,23 @@ def execute_project(project_dir, timeout=15):
                                       r'referenceerror|typeerror|is not recognized as',
                                       low_no_writeerror)
                     and (
+                        # NB : "." (pas "[ée]") a la place des lettres accentuees francaises dans
+                        # ces motifs — constate : la console PowerShell mange parfois "e" en un
+                        # caractere de remplacement IMPREVISIBLE selon l'encodage (observe : "e" ->
+                        # "Ǹ", pas le "�" standard U+FFFD attendu) qui ne matche NI "e" NI "e" NI
+                        # "�". Un point (n'importe quel caractere) a cette position precise reste
+                        # sans risque de faux positif (le radical du mot autour suffit a eviter
+                        # toute collision accidentelle avec un autre mot).
                         re.search(r'\b(argument|argv|param(?:etre|eter)?|option)s?\b.*'
-                                  r'\b(requis|required|manquant|missing|fournir|provide|sp[ée]cifi)',
+                                  r'\b(requis|required|manquant|missing|fournir|provide|sp.cifi)',
                                   low)
-                        or re.search(r'\b(veuillez|please)\b.*\b(fournir|provide|sp[ée]cifi|indiqu)', low)
+                        or re.search(r'\b(veuillez|please)\b.*\b(fournir|provide|sp.cifi|indiqu)', low)
                         # "Aucun motif/chemin/nom... fourni/donne/specifie" : tournure francaise
                         # courante pour "entree obligatoire manquante", constate sur un script de
                         # recherche de processus ("Aucun motif de recherche fourni.") qui ne
                         # contient ni "argument/parametre/option" ni "veuillez" -> ratee par les
                         # 2 regles ci-dessus, faux echec sur un CLI par ailleurs parfaitement sain.
-                        or re.search(r'\baucun[e]?\b.*\b(fourni[e]?|donn[ée][e]?|sp[ée]cifi[ée]?)\b', low)
+                        or re.search(r'\baucun[e]?\b.*\b(fourni[e]?|donn.[e]?|sp.cifi.[e]?)\b', low)
                         # "usage:" ET son equivalent francais "utilisation:" (tres frequent dans
                         # les scripts generes par ce pipeline, qui est entierement en francais) —
                         # rate par les regles ci-dessus qui ne cherchaient QUE le mot anglais.
