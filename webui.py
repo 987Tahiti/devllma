@@ -1226,7 +1226,15 @@ def execute_project(project_dir, timeout=15):
             # (constate : script sain avec $ErrorActionPreference='Stop' + Write-Error, faux echec
             # garanti). On le retire UNIQUEMENT pour ce check de plantage — une vraie exception
             # .NET non geree (ex: "System.FormatException") garde un nom distinct et reste detectee.
-            low_no_writeerror = low.replace("writeerrorexception", "")
+            # 2e source du meme faux positif (constate separement) : PowerShell RE-AFFICHE la ligne
+            # de code source fautive dans son message d'erreur ("+ ... Write-Error \"... $($_.
+            # Exception.Message)\"") — si ce Write-Error (idiome PowerShell tres courant pour decrire
+            # une erreur attrapee en try/catch) reference `.Exception.Message`/`.Exception....`, CE
+            # texte source echo contient aussi "exception", meme faux-positif par un autre biais.
+            # `\.exception\b` (avec le point) ne matche que l'ACCES A LA PROPRIETE, jamais un nom de
+            # classe complet comme "formatexception"/"nullreferenceexception" (pas de point avant),
+            # qui reste donc detecte normalement.
+            low_no_writeerror = re.sub(r'\.exception\b', '', low.replace("writeerrorexception", ""))
             cli_usage_exit = proc.returncode != 0 and (
                 # Signatures explicites argparse / click / typer
                 re.search(r'the following arguments are required'
