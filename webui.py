@@ -1377,6 +1377,19 @@ _HEAVY_MEDIA_RE = re.compile(
 _BUILD_PROGRAM_RE = re.compile(
     r'\b(outil|script|programme|logiciel|cli|ligne de commande|'
     r'python|javascript|typescript|node|module|package|bibliotheque|librairie)\b')
+# Signal ETROIT complementaire pour "site web"/"application web" (constate : "Cree un site web
+# de galerie d'images" partait a tort vers la generation media, "images" tombant dans la fenetre
+# de _HEAVY_MEDIA_RE apres "Cree"). Volontairement PAS ajoute a _BUILD_PROGRAM_RE (qui rendrait
+# "site"/"app" toujours sans-danger, cassant l'autre sens : "genere un logo pour mon site web"
+# doit RESTER une vraie demande media) — la distinction se fait par ORDRE des mots (cf. plus bas) :
+# ce n'est un signal "construire un site" que si "site web"/"application web" apparait AVANT le
+# premier mot-image apres le verbe de creation, pas apres (ce qui indiquerait plutot "... pour
+# mon site", un simple contexte/destination de l'image generee, pas l'objet construit).
+_WEBSITE_WORD_RE = re.compile(r'\b(site\s*web|site\s*internet|application\s*web|page\s*web|app\s*web)\b')
+_MEDIA_WORD_RE = re.compile(
+    r'\b(image|images|photo|photos|illustration|dessin|logo|visuel|banniere|avatar|'
+    r'video|videos|clip|animation|rendu)\b')
+_MEDIA_VERB_RE = re.compile(r'\b(gener\w*|cree\w*|creer|dessine\w*|fais|produis|fabrique\w*)\b')
 def is_heavy_media_request(prompt):
     low = strip_accents(prompt.lower())
     # "jeu video"/"mini-jeu video"/"jeu de..." = un JEU a developper (projet), PAS une
@@ -1391,6 +1404,13 @@ def is_heavy_media_request(prompt):
     # pour mon site").
     if _BUILD_PROGRAM_RE.search(low):
         return False
+    verb_m = _MEDIA_VERB_RE.search(low)
+    if verb_m:
+        tail = low[verb_m.end():verb_m.end() + 60]
+        site_m = _WEBSITE_WORD_RE.search(tail)
+        media_m = _MEDIA_WORD_RE.search(tail)
+        if site_m and (not media_m or site_m.start() < media_m.start()):
+            return False
     return bool(_HEAVY_MEDIA_RE.search(low))
 
 def match_existing_project(prompt):
