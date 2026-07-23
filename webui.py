@@ -1102,6 +1102,21 @@ def _capture_static_site_screenshot(project_dir, timeout=20):
         return None, None
     screenshot_path = os.path.join(project_dir, "_screenshot.png")
     url = "file:///" + index_path.replace("\\", "/")
+    # Piege recurrent (constate a plusieurs reprises) : une instance Edge d'arriere-plan deja
+    # active ("--no-startup-window", fonctionnalite "Startup Boost" d'Edge, se relance seule
+    # apres avoir ete fermee) fait echouer TOUTE capture headless suivante SILENCIEUSEMENT (exit 0,
+    # aucun fichier produit) - meme avec un --user-data-dir different, le verrou d'instance unique
+    # de Chromium ne se limite pas au dossier de profil. On la ferme prealablement (sans danger :
+    # elle se relance seule si l'utilisateur rouvre Edge, on ne touche JAMAIS aux fenetres actives).
+    try:
+        subprocess.run(
+            [POWERSHELL_EXE, "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*no-startup-window*' } | "
+             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+            timeout=10, capture_output=True)
+    except Exception:
+        pass
     try:
         subprocess.run(
             [EDGE_EXE, "--headless=new", "--disable-gpu", "--hide-scrollbars",
