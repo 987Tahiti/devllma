@@ -340,12 +340,22 @@ RÈGLES ABSOLUES:
   separes par des espaces (ex: resultat de `find ... -name "*.log"` non guillemete) — `basename`
   n'accepte qu'UN SEUL nom (+ suffixe optionnel), pas une liste (constate : avec 3 fichiers .log,
   `tar -czf archive.tar.gz -C "$DOSSIER" $(basename $LOGS)` a echoue avec "basename: extra operand",
-  et l'archive n'a jamais ete creee — le script marchait seulement avec 1 seul fichier trouve). Pour
-  compresser/traiter plusieurs fichiers trouves par `find`, utilise soit une boucle
-  (`while IFS= read -r f; do ...; done < <(find "$DOSSIER" -maxdepth 1 -name "*.log")`), soit un
-  tableau bash (`mapfile -t LOGS < <(find ...)` puis `tar -czf archive.tar.gz -C "$DOSSIER"
-  "${LOGS[@]##*/}"`), soit `find "$DOSSIER" -maxdepth 1 -name "*.log" -printf "%f\\n"` pour obtenir
-  directement les noms sans chemin (pas besoin de basename)."""
+  et l'archive n'a jamais ete creee — le script marchait seulement avec 1 seul fichier trouve).
+- RÈGLE CRITIQUE Bash/tar (compresser PLUSIEURS fichiers trouves par `find`/boucle) : `tar -czf
+  archive.tar.gz fichier` avec l'option `-c` (create) RECREE l'archive a CHAQUE appel — un `-czf`
+  execute plusieurs fois de suite sur le MEME chemin d'archive (ex: dans une boucle, un appel par
+  fichier) ne fait PAS grossir l'archive, il l'ECRASE a chaque iteration, ne conservant QUE le
+  dernier fichier traite. Combine a `--remove-files` (ou un `rm` separe des originaux), ceci cause
+  une PERTE DE DONNEES SILENCIEUSE et confirmee : avec 3 fichiers .log, exit 0, message "reussi",
+  mais SEUL le dernier fichier survit dans l'archive et les 2 autres sont supprimes du disque sans
+  jamais avoir ete sauvegardes nulle part. Il n'y a JAMAIS lieu d'appeler `tar -c`/`-czf` plus d'une
+  fois pour un meme fichier archive. La seule facon correcte de compresser plusieurs fichiers
+  trouves dynamiquement : rassembler TOUS les noms d'abord (tableau bash `mapfile -t LOGS < <(find
+  "$DOSSIER" -maxdepth 1 -name "*.log" -printf "%f\\n")`), PUIS un SEUL appel `tar -czf
+  archive.tar.gz -C "$DOSSIER" "${LOGS[@]}"` qui inclut tous les fichiers en un coup, et ce n'est
+  QU'APRÈS que cet appel unique a reussi (`$?` = 0) qu'on supprime les originaux avec `rm`. Ne
+  JAMAIS supprimer un fichier source avant d'avoir confirme qu'il est bien present dans l'archive
+  finale."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
