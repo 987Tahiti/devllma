@@ -71,6 +71,7 @@ GO_EXE         = r"C:\Program Files\Go\bin\go.exe"
 # cache chaud) et declenche un faux echec via le timeout. Un chemin fixe partage, rechauffe une
 # fois pour toutes, evite ce piege quel que soit le compte qui execute le service.
 GO_CACHE_DIR   = r"C:\Devllma\.gocache"
+EDGE_EXE       = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 os.makedirs(WORKSPACE, exist_ok=True)
 
 # ─── Mémoire globale du Brain ────────────────────────────────────────────────
@@ -1074,6 +1075,28 @@ def _http_probe(port):
         pass  # pas de FastAPI/openapi.json exploitable -> on garde le check racine seul
     return True, root_status
 
+def _capture_static_site_screenshot(project_dir, timeout=20):
+    """Capture une image du rendu reel d'un site statique via Edge headless (--headless=new),
+    pour verifier visuellement le rendu sans dependre d'un humain qui ouvre un navigateur a la
+    main. Best-effort : ne doit JAMAIS transformer un succes en echec si Edge est absent ou
+    plante (mecanisme neuf, on reste additif tant qu'il n'est pas eprouve a grande echelle).
+    Retourne (ok_bool_ou_None, chemin_capture_ou_None)."""
+    index_path = os.path.join(project_dir, "index.html")
+    if not os.path.exists(EDGE_EXE) or not os.path.exists(index_path):
+        return None, None
+    screenshot_path = os.path.join(project_dir, "_screenshot.png")
+    url = "file:///" + index_path.replace("\\", "/")
+    try:
+        subprocess.run(
+            [EDGE_EXE, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+             f"--screenshot={screenshot_path}", "--window-size=1280,800", url],
+            timeout=timeout, capture_output=True)
+    except Exception:
+        return None, None
+    if os.path.exists(screenshot_path) and os.path.getsize(screenshot_path) > 1024:
+        return True, screenshot_path
+    return False, (screenshot_path if os.path.exists(screenshot_path) else None)
+
 def execute_project(project_dir, timeout=15):
     # Site web statique (index.html a la racine, AUCUN serveur backend detecte) : le/les
     # fichier(s) .js associes (script.js/main.js...) sont du code COTE NAVIGATEUR (utilisent
@@ -1087,6 +1110,9 @@ def execute_project(project_dir, timeout=15):
     if os.path.exists(os.path.join(project_dir, "index.html")):
         is_static_check, _ = _detect_server_port(project_dir)
         if not is_static_check:
+            shot_ok, shot_path = _capture_static_site_screenshot(project_dir)
+            if shot_ok:
+                return True, f"(site web statique — capture d'écran du rendu réel vérifiée : {os.path.basename(shot_path)})", "index.html"
             return True, "(site web statique — à vérifier en ouvrant index.html dans un navigateur, pas d'exécution JS hors navigateur)", "index.html"
     ep = find_entry_point(project_dir)
     if not ep:
