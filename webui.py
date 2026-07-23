@@ -481,7 +481,16 @@ for a in ["coder","backend","frontend","architect","database"]:
 
 # ─── Outils fichiers ─────────────────────────────────────────────────────────
 CODE_EXTS = {'.py','.js','.ts','.html','.css','.json','.yml','.yaml',
-             '.txt','.md','.sql','.sh','.env','.toml','.ini','.cfg','.jsx','.tsx'}
+             '.txt','.md','.sql','.sh','.env','.toml','.ini','.cfg','.jsx','.tsx',
+             '.go','.ps1','.mjs','.cjs'}
+# .go/.ps1 manquaient ici (constate : une demande d'EDITION sur un projet Go existant lisait
+# `existing = {}` malgre un main.go bien present -> le pipeline croyait le projet vide ("cible
+# mais vide"), basculait sur la consigne "Cree TOUS les fichiers" au lieu de "MODIFIE le code
+# existant", et le modele a REECRIT tout le fichier en ne repondant qu'a la nouvelle demande —
+# perte totale de la fonctionnalite precedente (conversion int<->romain remplacee par une simple
+# validation, elle-meme buguee). Bug present depuis l'ajout du support Go/PowerShell, silencieux
+# sur TOUTE edition d'un projet Go/PowerShell existant jusqu'a ce jour. .mjs/.cjs ajoutes par la
+# meme occasion (memes risque, modules JS valides dans ce pipeline).
 
 def read_project(project_dir, max_chars=1600, total_budget=9000, max_files=8):
     """Lit le code source d'un projet, en bornant la taille (sinon prompt trop gros -> timeout CPU).
