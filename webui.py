@@ -382,7 +382,19 @@ RÈGLES ABSOLUES:
   bug Get-Volume/.FreeSpace ci-dessus : ne confonds JAMAIS une PROPRIETE d'un objet retourne
   (ex: `.Status`, `.State`) avec un PARAMETRE du cmdlet qui le genere — pour filtrer par une
   propriete, utilise `Get-X | Where-Object PropertyName -eq valeur`, jamais `Get-X -PropertyName
-  valeur` sauf si tu es certain que ce parametre existe reellement sur CE cmdlet precis."""
+  valeur` sauf si tu es certain que ce parametre existe reellement sur CE cmdlet precis.
+- RÈGLE CRITIQUE PowerShell (continuation de ligne avec backtick `` ` ``) : le backtick DOIT être
+  le TOUT DERNIER caractère de la ligne pour continuer une commande sur la ligne suivante — un
+  commentaire `# ...` placé APRÈS le backtick sur la même ligne CASSE silencieusement la
+  continuation (constate : `New-ScheduledTaskSettingsSet -RestartCount 3 \\`  # commentaire` suivi
+  d'une ligne `-RestartInterval (...)` — la commande s'exécute alors PARTIELLEMENT avec seulement
+  les parametres AVANT le commentaire, et les parametres des lignes suivantes deviennent des
+  commandes invalides séparées ("-RestartInterval : terme non reconnu comme nom d'applet de
+  commande"), sans jamais planter le script si `$ErrorActionPreference = 'Stop'` n'est pas actif —
+  le resultat final ($Settings dans cet exemple) reste utilisable mais avec des parametres
+  manquants, un bug silencieux et fonctionnellement incorrect). Ne JAMAIS mettre de commentaire
+  sur une ligne se terminant par un backtick de continuation ; place le commentaire sur sa PROPRE
+  ligne AVANT, ou repousse-le apres la fin complete de la commande."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
