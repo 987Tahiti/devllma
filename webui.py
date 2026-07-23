@@ -428,7 +428,25 @@ RÈGLES ABSOLUES:
   le resultat final ($Settings dans cet exemple) reste utilisable mais avec des parametres
   manquants, un bug silencieux et fonctionnellement incorrect). Ne JAMAIS mettre de commentaire
   sur une ligne se terminant par un backtick de continuation ; place le commentaire sur sa PROPRE
-  ligne AVANT, ou repousse-le apres la fin complete de la commande."""
+  ligne AVANT, ou repousse-le apres la fin complete de la commande.
+- RÈGLE CRITIQUE PowerShell→JSON (`ConvertTo-Json` sur un tableau a UN SEUL element) : si un script
+  Python/JS appelle PowerShell et parse sa sortie JSON en attendant une LISTE d'objets (ex: liste
+  de disques, de processus, d'adaptateurs...), `$tableau | ConvertTo-Json` (via le PIPE) sur un
+  tableau qui ne contient QU'UN SEUL element produit un objet JSON NU `{...}`, PAS un tableau
+  `[{...}]` — le pipe deroule/aplatit un tableau a un seul element avant que ConvertTo-Json le
+  reçoive. Constate directement : un script combinant PowerShell (avec fallback psutil) pour
+  lister les disques a plante avec "'str' object has no attribute 'get'" dès qu'il n'y avait
+  qu'UN SEUL disque sur la machine — `json.loads(...)` a retourne un dict au lieu d'une liste, et
+  boucler dessus (`for disk in disk_info`) iterait sur les CLES du dict (des chaines), pas sur des
+  objets. Ce bug ne se manifeste QUE quand le nombre de resultats vaut EXACTEMENT 1 (0 ou 2+
+  elements donnent le bon comportement), le rendant difficile a detecter sur un test avec
+  plusieurs elements. Ce pipeline tourne sous Windows PowerShell 5.1 (verifie :
+  `$PSVersionTable.PSVersion` = 5.1) — le flag `-AsArray` de `ConvertTo-Json` N'EXISTE PAS sur
+  cette version (introduit seulement en PowerShell 6.2+, produit "ParameterBindingException:
+  NamedParameterNotFound" si utilise ici). Le fix VERIFIE qui fonctionne en 5.1 : appeler
+  `ConvertTo-Json -InputObject $tableau` (le tableau passe en PARAMETRE NOMME), jamais
+  `$tableau | ConvertTo-Json` — confirmé directement : `-InputObject` préserve le wrapper `[...]`
+  même pour un tableau à un seul élément, le pipe non."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
