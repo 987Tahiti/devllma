@@ -1273,12 +1273,17 @@ def execute_project(project_dir, timeout=15):
                 # Seuil releve de 300 a 600 (constate : un CLI a PLUSIEURS options nommees, ex.
                 # -u/-n/-d avec une ligne de description chacune, produit un bloc "usage:" bien
                 # forme mais legitimement >300 caracteres — 498 caracteres mesures sur un script
-                # de healthcheck sain, faux echec garanti par le seuil trop strict). 600 reste tres
-                # en dessous d'une vraie trace d'erreur (Traceback/Exception font typiquement
+                # de healthcheck sain, faux echec garanti par le seuil trop strict). Puis releve a
+                # 900 (constate : un Write-Error PowerShell ajoute TOUJOURS un pied de page verbeux
+                # ("+ CategoryInfo : ...", "+ FullyQualifiedErrorId : ...") — pur bruit sans aucun
+                # pouvoir discriminant, present sur CHAQUE erreur PowerShell quelle qu'elle soit —
+                # qui a lui seul ajoute 150-250 caracteres, poussant un message d'usage par ailleurs
+                # tres court (ex: "Aucun chemin de fichier specifie") a 650 caracteres). 900 reste
+                # tres en dessous d'une vraie trace d'erreur (Traceback/Exception font typiquement
                 # plusieurs centaines de caracteres PAR frame), donc ne relache pas la detection
                 # de vrais plantages — ceux-ci sont de toute facon deja exclus par la liste de
                 # signatures ci-dessous.
-                or (len(combined) < 600
+                or (len(combined) < 900
                     # NB : ".ps1:N" (position d'erreur) est volontairement ABSENT de cette liste,
                     # contrairement a son equivalent Node ".js:N" — en PowerShell, CE motif
                     # apparait TOUJOURS des qu'une erreur est levee (Write-Error OU vraie exception
