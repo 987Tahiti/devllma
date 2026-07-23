@@ -1260,6 +1260,13 @@ def execute_project(project_dir, timeout=15):
                         # les scripts generes par ce pipeline, qui est entierement en francais) —
                         # rate par les regles ci-dessus qui ne cherchaient QUE le mot anglais.
                         or re.search(r'(?m)^\s*(?:usage|utilisation)\s*:', low)
+                        # "Le nom du service est requis" (ou variante : "Le chemin est requis"...) —
+                        # tournure francaise qui NOMME directement l'entree manquante plutot que
+                        # d'utiliser le mot generique "argument/parametre/option", ratee par toutes
+                        # les regles ci-dessus (constate sur un script PowerShell de redemarrage de
+                        # service : "Le nom du service est requis.", aucun mot-cle argument/veuillez/
+                        # aucun/usage, faux echec sur un CLI par ailleurs correct et bien ecrit).
+                        or re.search(r'\best\s+requis\b', low)
                     ))
             )
             if cli_usage_exit:
