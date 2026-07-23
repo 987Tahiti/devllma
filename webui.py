@@ -1306,7 +1306,7 @@ def execute_project(project_dir, timeout=15):
                         # les regles ci-dessus (constate sur un script PowerShell de redemarrage de
                         # service : "Le nom du service est requis.", aucun mot-cle argument/veuillez/
                         # aucun/usage, faux echec sur un CLI par ailleurs correct et bien ecrit).
-                        or re.search(r'\best\s+requis\b', low)
+                        or re.search(r'\b(?:est|sont)\s+requis\b', low)
                     ))
             )
             if cli_usage_exit:
