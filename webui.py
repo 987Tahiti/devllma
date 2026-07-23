@@ -1197,6 +1197,14 @@ def execute_project(project_dir, timeout=15):
             out, _ = proc.communicate(timeout=eff_timeout)
             combined = (out or "").strip()[:800]
             low = combined.lower()
+            # "WriteErrorException" est le nom INTERNE que PowerShell donne a TOUT appel
+            # Write-Error dans FullyQualifiedErrorId — meme pour un message d'usage CLI parfaitement
+            # intentionnel (ex: "Write-Error 'Le nom du service est requis.'"). Ce nom contient
+            # "exception", ce qui declenchait a tort l'exclusion "signature de plantage" ci-dessous
+            # (constate : script sain avec $ErrorActionPreference='Stop' + Write-Error, faux echec
+            # garanti). On le retire UNIQUEMENT pour ce check de plantage — une vraie exception
+            # .NET non geree (ex: "System.FormatException") garde un nom distinct et reste detectee.
+            low_no_writeerror = low.replace("writeerrorexception", "")
             cli_usage_exit = proc.returncode != 0 and (
                 # Signatures explicites argparse / click / typer
                 re.search(r'the following arguments are required'
@@ -1244,7 +1252,7 @@ def execute_project(project_dir, timeout=15):
                     and not re.search(r'traceback|exception|error:.*\bat\b|at Object\.|at Module\.|'
                                       r'\.js:\d+|\.ps1:\d+|line \d+:.*(?:syntax error|command not found)|'
                                       r'referenceerror|typeerror|is not recognized as',
-                                      low)
+                                      low_no_writeerror)
                     and (
                         re.search(r'\b(argument|argv|param(?:etre|eter)?|option)s?\b.*'
                                   r'\b(requis|required|manquant|missing|fournir|provide|sp[ée]cifi)',
