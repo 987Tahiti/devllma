@@ -383,6 +383,15 @@ RÈGLES ABSOLUES:
   (ex: `.Status`, `.State`) avec un PARAMETRE du cmdlet qui le genere — pour filtrer par une
   propriete, utilise `Get-X | Where-Object PropertyName -eq valeur`, jamais `Get-X -PropertyName
   valeur` sauf si tu es certain que ce parametre existe reellement sur CE cmdlet precis.
+- RÈGLE CRITIQUE PowerShell (ordre `param()` vs `$ErrorActionPreference`) : si le script declare un
+  bloc `param(...)` (parametres nommes/types), ce bloc DOIT être la TOUTE PREMIERE instruction du
+  fichier — RIEN, pas meme `$ErrorActionPreference = 'Stop'`, ne doit le precéder (seuls des
+  commentaires/lignes vides sont tolérés avant). Mettre `$ErrorActionPreference` AVANT `param()`
+  CASSE le bloc entier : PowerShell traite alors `param` comme une commande inconnue ("param:
+  Le terme «param» n'est pas reconnu comme nom d'applet de commande"), constate directement en
+  testant ce cas précis. Si le script utilise `param()`, place `$ErrorActionPreference = 'Stop'`
+  JUSTE APRÈS le bloc `param(...)`, jamais avant. Si le script n'utilise PAS `param()` (accès via
+  `$args[0]` par exemple), `$ErrorActionPreference = 'Stop'` reste bien la toute première ligne.
 - RÈGLE CRITIQUE PowerShell (continuation de ligne avec backtick `` ` ``) : le backtick DOIT être
   le TOUT DERNIER caractère de la ligne pour continuer une commande sur la ligne suivante — un
   commentaire `# ...` placé APRÈS le backtick sur la même ligne CASSE silencieusement la
