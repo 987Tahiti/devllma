@@ -355,7 +355,17 @@ RÈGLES ABSOLUES:
   archive.tar.gz -C "$DOSSIER" "${LOGS[@]}"` qui inclut tous les fichiers en un coup, et ce n'est
   QU'APRÈS que cet appel unique a reussi (`$?` = 0) qu'on supprime les originaux avec `rm`. Ne
   JAMAIS supprimer un fichier source avant d'avoir confirme qu'il est bien present dans l'archive
-  finale."""
+  finale.
+- PowerShell/espace disque : `Get-Volume` N'A PAS de propriete `.FreeSpace` (constate : un script
+  utilisant `$volume.FreeSpace` avec `$volume = Get-Volume -DriveLetter ...` a affiche "0 Go" comme
+  espace libre pour TOUS les lecteurs, sur un disque reellement a moitie plein — aucune erreur, car
+  PowerShell convertit silencieusement une propriete manquante en `$null`, et `$null / 1GB` vaut 0).
+  Chaque cmdlet disque a SES PROPRES noms de propriete, ne pas les confondre : `Get-Volume` expose
+  `.Size` (taille totale) et `.SizeRemaining` (espace libre) — PAS `.FreeSpace` ; `Get-PSDrive`
+  expose `.Used`/`.Free` (en octets) ; `Get-CimInstance -ClassName Win32_LogicalDisk` expose
+  `.Size`/`.FreeSpace` (celui-ci EST correct, mais seulement avec Win32_LogicalDisk, pas Get-Volume).
+  Avant d'utiliser une propriete de taille/espace sur un objet PowerShell, verifie qu'elle existe
+  reellement pour CE cmdlet precis (elles ne sont pas interchangeables d'un cmdlet a l'autre)."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
