@@ -335,7 +335,17 @@ RÈGLES ABSOLUES:
   n'existe, et AUCUNE colonne memoire (%mem/RSS) n'est jamais affichee, meme avec `ps aux` (erreur
   constatee : "ps: unknown option -- o"). Pour lister les processus par consommation memoire sous
   Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command "Get-Process |
-  Sort-Object WorkingSet -Descending | Select-Object -First 5 Name,WorkingSet"`."""
+  Sort-Object WorkingSet -Descending | Select-Object -First 5 Name,WorkingSet"`.
+- Bash : NE JAMAIS faire `$(basename $VARIABLE)` quand `$VARIABLE` peut contenir PLUSIEURS chemins
+  separes par des espaces (ex: resultat de `find ... -name "*.log"` non guillemete) — `basename`
+  n'accepte qu'UN SEUL nom (+ suffixe optionnel), pas une liste (constate : avec 3 fichiers .log,
+  `tar -czf archive.tar.gz -C "$DOSSIER" $(basename $LOGS)` a echoue avec "basename: extra operand",
+  et l'archive n'a jamais ete creee — le script marchait seulement avec 1 seul fichier trouve). Pour
+  compresser/traiter plusieurs fichiers trouves par `find`, utilise soit une boucle
+  (`while IFS= read -r f; do ...; done < <(find "$DOSSIER" -maxdepth 1 -name "*.log")`), soit un
+  tableau bash (`mapfile -t LOGS < <(find ...)` puis `tar -czf archive.tar.gz -C "$DOSSIER"
+  "${LOGS[@]##*/}"`), soit `find "$DOSSIER" -maxdepth 1 -name "*.log" -printf "%f\\n"` pour obtenir
+  directement les noms sans chemin (pas besoin de basename)."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
