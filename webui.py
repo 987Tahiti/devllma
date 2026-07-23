@@ -392,6 +392,19 @@ RÈGLES ABSOLUES:
   testant ce cas précis. Si le script utilise `param()`, place `$ErrorActionPreference = 'Stop'`
   JUSTE APRÈS le bloc `param(...)`, jamais avant. Si le script n'utilise PAS `param()` (accès via
   `$args[0]` par exemple), `$ErrorActionPreference = 'Stop'` reste bien la toute première ligne.
+- RÈGLE CRITIQUE PowerShell (bloc `param()` — valeur par défaut référençant un paramètre
+  MANDATORY) : dans un bloc `param(...)`, la valeur par défaut d'un paramètre NE DOIT JAMAIS
+  référencer un AUTRE paramètre `[Parameter(Mandatory=$true)]` déclaré avant lui (ex:
+  `[int]$Port` mandatory, PUIS `[string]$RuleName = "... $Port"`). Si le script est lancé SANS
+  fournir ce paramètre obligatoire, PowerShell tente d'invite (prompt) interactivement sa valeur
+  AVANT de pouvoir évaluer l'expression par défaut qui en dépend — sous ce pipeline (aucune console
+  interactive attachée), ce prompt ne reçoit JAMAIS de réponse et le processus reste BLOQUÉ
+  INDÉFINIMENT (pas une erreur rapide, un vrai blocage qui consomme tout le timeout d'exécution).
+  Vérifié directement : le même bloc fonctionne parfaitement (sortie immédiate, code 0) dès que le
+  paramètre référencé a SA PROPRE valeur par défaut au lieu d'être Mandatory. Ne JAMAIS faire
+  dépendre la valeur par défaut d'un paramètre d'un autre paramètre Mandatory — soit donne aussi
+  une valeur par défaut au premier paramètre, soit calcule la valeur dérivée (ex: `$RuleName`) DANS
+  le corps du script après le bloc `param()`, jamais dans l'expression de défaut elle-même.
 - RÈGLE CRITIQUE PowerShell (continuation de ligne avec backtick `` ` ``) : le backtick DOIT être
   le TOUT DERNIER caractère de la ligne pour continuer une commande sur la ligne suivante — un
   commentaire `# ...` placé APRÈS le backtick sur la même ligne CASSE silencieusement la
