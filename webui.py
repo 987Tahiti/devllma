@@ -337,6 +337,18 @@ RÈGLES ABSOLUES:
   constatee : "ps: unknown option -- o"). Pour lister les processus par consommation memoire sous
   Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command "Get-Process |
   Sort-Object WorkingSet -Descending | Select-Object -First 5 Name,WorkingSet"`.
+- Bash sur Windows (meme environnement) : `df -h` n'affiche JAMAIS de peripherique au format
+  `/dev/sda1` — la colonne "Filesystem" contient directement un CHEMIN de type `C:/Program
+  Files/Git` (verifie directement). Un filtre `grep "^/dev/"` pour ignorer la ligne d'en-tete
+  exclut alors TOUTES les lignes reelles, produisant un rapport disque totalement VIDE (aucune
+  erreur, `df` reussit, juste zero ligne apres le filtre — faux succes silencieux). Pour ignorer
+  uniquement la ligne d'en-tete de `df -h`, utilise `tail -n +2` (saute la 1re ligne), jamais un
+  filtre `grep "^/dev/"`. De meme, `$OSTYPE` vaut `cygwin` sur ce Git Bash (verifie directement),
+  PAS `msys` ni `win32` — un test `[[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]]` pour
+  detecter "on est sous Windows" est TOUJOURS faux ici et saute silencieusement tout bloc prevu
+  pour ce cas (ex: un appel PowerShell de secours). Inclus `cygwin` dans ce genre de test, ou
+  verifie plutot la presence de `powershell.exe` dans le PATH (`command -v powershell.exe`), plus
+  robuste que de deviner la valeur exacte de `$OSTYPE`.
 - Bash : NE JAMAIS faire `$(basename $VARIABLE)` quand `$VARIABLE` peut contenir PLUSIEURS chemins
   separes par des espaces (ex: resultat de `find ... -name "*.log"` non guillemete) — `basename`
   n'accepte qu'UN SEUL nom (+ suffixe optionnel), pas une liste (constate : avec 3 fichiers .log,
