@@ -1231,22 +1231,27 @@ def execute_project(project_dir, timeout=15):
             out, _ = proc.communicate(timeout=eff_timeout)
             combined = (out or "").strip()[:800]
             low = combined.lower()
-            # "WriteErrorException" est le nom INTERNE que PowerShell donne a TOUT appel
-            # Write-Error dans FullyQualifiedErrorId — meme pour un message d'usage CLI parfaitement
-            # intentionnel (ex: "Write-Error 'Le nom du service est requis.'"). Ce nom contient
-            # "exception", ce qui declenchait a tort l'exclusion "signature de plantage" ci-dessous
-            # (constate : script sain avec $ErrorActionPreference='Stop' + Write-Error, faux echec
-            # garanti). On le retire UNIQUEMENT pour ce check de plantage — une vraie exception
-            # .NET non geree (ex: "System.FormatException") garde un nom distinct et reste detectee.
-            # 2e source du meme faux positif (constate separement) : PowerShell RE-AFFICHE la ligne
-            # de code source fautive dans son message d'erreur ("+ ... Write-Error \"... $($_.
-            # Exception.Message)\"") — si ce Write-Error (idiome PowerShell tres courant pour decrire
-            # une erreur attrapee en try/catch) reference `.Exception.Message`/`.Exception....`, CE
-            # texte source echo contient aussi "exception", meme faux-positif par un autre biais.
+            # PowerShell ajoute TOUJOURS un pied de page structure ("+ CategoryInfo : ... [],
+            # XxxException" / "+ FullyQualifiedErrorId : ...") a CHAQUE erreur, intentionnelle ou
+            # non — et le nom de la classe d'exception y varie selon le MECANISME utilise pour
+            # lever l'erreur : "WriteErrorException" pour Write-Error, "RuntimeException" pour
+            # throw, "ParameterBindingException" pour un parametre de cmdlet invalide, etc. Tenter
+            # de blacklister ces noms un par un (constate : 2 corriges deja, un 3e -
+            # RuntimeException via `throw "..."` - trouve juste apres) est un jeu perdu d'avance —
+            # ces lignes sont du PUR pied de page, sans AUCUN pouvoir discriminant plantage-vs-
+            # intentionnel (chaque erreur PowerShell en a un, quelle que soit sa cause). On les
+            # retire ENTIEREMENT (par motif de ligne, pas par nom de classe) pour ce seul check —
+            # le garde-fou reste les motifs POSITIFS (est/sont requis, aucun...fourni, usage:...)
+            # qu'une vraie erreur non liee a un message d'usage ne matche pas par coincidence.
+            # 2e source du meme faux positif (distincte) : PowerShell RE-AFFICHE la ligne de code
+            # source fautive dans son message d'erreur ("+ ... Write-Error \"... $($_.Exception.
+            # Message)\"") — si ce Write-Error (idiome tres courant) reference `.Exception.Message`,
+            # ce texte source echo contient aussi "exception", meme faux-positif par un 3e biais.
             # `\.exception\b` (avec le point) ne matche que l'ACCES A LA PROPRIETE, jamais un nom de
             # classe complet comme "formatexception"/"nullreferenceexception" (pas de point avant),
-            # qui reste donc detecte normalement.
-            low_no_writeerror = re.sub(r'\.exception\b', '', low.replace("writeerrorexception", ""))
+            # qui reste donc detecte normalement s'il apparait EN DEHORS du pied de page retire.
+            low_no_writeerror = re.sub(r'\.exception\b', '',
+                re.sub(r'(?m)^\s*\+\s*(categoryinfo|fullyqualifiederrorid)\s*:.*$', '', low))
             cli_usage_exit = proc.returncode != 0 and (
                 # Signatures explicites argparse / click / typer
                 re.search(r'the following arguments are required'
