@@ -404,6 +404,25 @@ RÈGLES ABSOLUES:
   simple `-split ' '` ou `.ToString()` dessus ne fait AUCUNE conversion utile (aucune espace dans la
   chaine). Conversion verifiee : `[Management.ManagementDateTimeConverter]::ToDateTime($driver.DriverDate)`
   retourne un vrai `[DateTime]` correctement forme.
+- RÈGLE CRITIQUE PowerShell (appel de cmdlet SANS parentheses = mode "argument", pas mode
+  "expression") : `Write-Host "=" * 60` (par exemple pour une ligne de separation repetee) N'EVALUE
+  PAS `"=" * 60` comme une expression — un cmdlet appele sans parentheses autour de ses arguments
+  parse chaque token separe par un espace comme un ARGUMENT LITTERAL DISTINCT. Constate directement :
+  `Write-Host "=" * 60` affiche `= * 60` (trois arguments litteraux concatenes avec un espace par
+  Write-Host), PAS 60 signes `=`. Fix verifie : `Write-Host ("=" * 60)` — mettre l'EXPRESSION ENTIERE
+  entre parentheses force le mode expression et evalue bien la multiplication AVANT de la passer en
+  argument unique. Regle generale : tout calcul/expression (arithmetique, concatenation `+`,
+  operateur `-f`...) passe en argument direct a un cmdlet (`Write-Host`, `Write-Output`...) DOIT etre
+  entoure de parentheses, jamais laisse nu apres le nom du cmdlet.
+- PowerShell/tâches planifiées (`Get-ScheduledTask`) : les objets retournes par `Get-ScheduledTask`
+  N'ONT PAS de propriete `.NextRunTime` (ni `.LastRunTime`) — ces informations d'execution ne sont
+  QUE sur l'objet retourne par `Get-ScheduledTaskInfo`, une commande SEPAREE. Constate directement :
+  `(Get-ScheduledTask | Select -First 1).NextRunTime` est toujours vide/`$null` (aucune erreur, la
+  propriete manquante est silencieusement `$null`), alors que `Get-ScheduledTask | Get-ScheduledTaskInfo`
+  expose bien `.NextRunTime`/`.LastRunTime`/`.LastTaskResult` correctement remplis. Pour afficher la
+  prochaine execution d'une tache, pipe TOUJOURS le resultat de `Get-ScheduledTask` (ou chaque tache
+  individuellement dans une boucle) vers `Get-ScheduledTaskInfo` — ne jamais supposer que ces
+  proprietes existent directement sur l'objet de base `Get-ScheduledTask`.
 - RÈGLE CRITIQUE PowerShell (ordre `param()` vs `$ErrorActionPreference`) : si le script declare un
   bloc `param(...)` (parametres nommes/types), ce bloc DOIT être la TOUTE PREMIERE instruction du
   fichier — RIEN, pas meme `$ErrorActionPreference = 'Stop'`, ne doit le precéder (seuls des
