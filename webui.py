@@ -756,7 +756,20 @@ def write_files(project_dir, files):
         fname = _sanitize_filename(fname)
         fpath = os.path.join(project_dir, fname.replace("/", os.sep))
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
-        with open(fpath, "w", encoding="utf-8") as f: f.write(code)
+        # .ps1 : Windows PowerShell 5.1 (pas Core/7+) lit un script -File SANS BOM en supposant
+        # l'ANSI local plutot que l'UTF-8, ce qui corrompt le PARSEUR (pas juste l'affichage) des
+        # qu'un caractere multi-octets specifique apparait (constate directement, reproduit isole :
+        # "✓"/"✗" U+2713/U+2717, encodage UTF-8 sur 3 octets, casse le tokenizer PowerShell — un octet
+        # est mal interprete comme un guillemet `"` litteral, terminant prematurement la chaine ->
+        # "Jeton inattendu" / "Le terminateur \" est manquant dans la chaine", plantage total avant
+        # meme l'execution). Les lettres accentuees simples (e/e, 2 octets) NE causent PAS ce
+        # plantage (juste un affichage mangle, deja documente separement) — seul un BOM UTF-8 en
+        # tete de fichier force Windows PowerShell 5.1 a lire correctement N'IMPORTE QUEL caractere
+        # Unicode sans ambiguite (verifie directement : le MEME contenu, avec BOM, s'execute sans
+        # erreur). Encodage 'utf-8-sig' UNIQUEMENT pour .ps1 — jamais pour .sh (un BOM avant le
+        # shebang `#!` le rend meconnaissable) ni les autres langages (non concernes, BOM inutile).
+        enc = "utf-8-sig" if fpath.lower().endswith(".ps1") else "utf-8"
+        with open(fpath, "w", encoding=enc) as f: f.write(code)
         created.append(fname)
     return created
 
