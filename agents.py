@@ -161,7 +161,7 @@ _SNIPPET_RE = re.compile(r'\b(fonctions?|methodes?|snippet|one[- ]?liner|regex|e
 _PROJECT_RE = re.compile(
     r'\b(projet|application|app|site|jeu|bot|logiciel|serveur|api|backend|frontend|'
     r'interface|dashboard|tableau de bord|page|gui|fenetre|script|programme|fichier|'
-    r'dossier|docker|deploiement|deploie|base de donnees|bdd|plusieurs|module|package|'
+    r'ligne de commande|cli|dossier|docker|deploiement|deploie|base de donnees|bdd|plusieurs|module|package|'
     r'installe|execute|lance|pytest|tests?\b|sauvegarde|enregistre|bureau|desktop)')
 # Nom de fichier explicite (utils.py, index.html...) = l'utilisateur veut un fichier ecrit.
 _FILENAME_RE = re.compile(r'\b[\w-]+\.(py|js|ts|html|css|json|txt|md|csv|sql|bat|ps1|sh|docx|xlsx|pdf)\b')
