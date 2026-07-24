@@ -1335,6 +1335,37 @@ def _capture_static_site_screenshot(project_dir, timeout=20):
         return True, screenshot_path
     return False, (screenshot_path if os.path.exists(screenshot_path) else None)
 
+def _missing_referenced_assets(project_dir):
+    """Verifie que les fichiers de CODE LOCAUX (.js/.css — jamais les medias binaires type
+    .mp3/.png que le modele ne peut de toute facon pas generer) references par index.html via
+    src=/href= existent reellement sur disque. Constate : un site "compte a rebours
+    personnalise" livre avec SEULEMENT index.html+style.css (2 fichiers au lieu de 3) —
+    index.html contient bien `<script src="script.js">`, mais script.js n'a JAMAIS ete cree
+    (generation tronquee/incomplete). Le check statique existant (juste "index.html existe")
+    ne detectait pas ce cas -> ok=True renvoye pour un site dont le bouton "Demarrer" ne fait
+    RIEN (aucune logique JS du tout). Scope volontairement restreint a .js/.css : un site qui
+    reference un .mp3/.png/.mp4 manquant est une limite structurelle DIFFERENTE (asset binaire
+    que le modele ne sait pas produire), pas une generation tronquee — les compter ici
+    produirait des faux positifs sur des sites par ailleurs corrects. Retourne la liste des
+    chemins relatifs references mais introuvables (liste vide si tout existe)."""
+    index_path = os.path.join(project_dir, "index.html")
+    try:
+        with open(index_path, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+    except Exception:
+        return []
+    refs = re.findall(r'(?:src|href)\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+    missing = []
+    for ref in refs:
+        ref = ref.split("#")[0].split("?")[0].strip()
+        if not ref or ref.startswith(("http://", "https://", "//", "data:", "mailto:", "tel:")):
+            continue
+        if not ref.lower().endswith((".js", ".css")):
+            continue
+        if not os.path.exists(os.path.join(project_dir, ref.replace("/", os.sep))):
+            missing.append(ref)
+    return missing
+
 def execute_project(project_dir, timeout=15):
     # Site web statique (index.html a la racine, AUCUN serveur backend detecte) : le/les
     # fichier(s) .js associes (script.js/main.js...) sont du code COTE NAVIGATEUR (utilisent
@@ -1348,6 +1379,9 @@ def execute_project(project_dir, timeout=15):
     if os.path.exists(os.path.join(project_dir, "index.html")):
         is_static_check, _ = _detect_server_port(project_dir)
         if not is_static_check:
+            missing = _missing_referenced_assets(project_dir)
+            if missing:
+                return False, f"Fichier(s) référencé(s) par index.html mais introuvable(s) sur disque : {', '.join(missing)} — génération probablement tronquée/incomplète", "index.html"
             shot_ok, shot_path = _capture_static_site_screenshot(project_dir)
             if shot_ok:
                 return True, f"(site web statique — capture d'écran du rendu réel vérifiée : {os.path.basename(shot_path)})", "index.html"
