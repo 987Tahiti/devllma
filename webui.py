@@ -446,7 +446,22 @@ RÈGLES ABSOLUES:
   NamedParameterNotFound" si utilise ici). Le fix VERIFIE qui fonctionne en 5.1 : appeler
   `ConvertTo-Json -InputObject $tableau` (le tableau passe en PARAMETRE NOMME), jamais
   `$tableau | ConvertTo-Json` — confirmé directement : `-InputObject` préserve le wrapper `[...]`
-  même pour un tableau à un seul élément, le pipe non."""
+  même pour un tableau à un seul élément, le pipe non.
+- RÈGLE CRITIQUE PowerShell (opérateur virgule `,` plus PRIORITAIRE que les opérateurs arithmétiques
+  `*`/`+`/`-` dans une liste séparée par virgules) : écrire `"-" * 50, "-" * 20` (par exemple pour
+  générer des lignes de séparation `-f` d'un tableau ASCII) NE PRODUIT PAS un tableau de deux
+  chaînes répétées — PowerShell parse cette expression comme `"-" * (50, "-" * 20)`, c'est-à-dire
+  que la virgule regroupe D'ABORD `50, "-" * 20` en tableau AVANT que `*` s'applique, puis `*`
+  tente de convertir ce tableau en `Int32` et échoue. Constaté directement : `$c = "-" * 3, "x"`
+  plante avec "Impossible de convertir la valeur «System.Object[]» ... en type «System.Int32»" (ou,
+  si le premier opérande est numérique, "ne contient pas de méthode nommée «op_Multiply»") ; ce même
+  bug a fait planter un script listant les pilotes système avec `Write-Host ("{0,-50} {1,-20}
+  {2,-15}" -f "-" * 50, "-" * 20, "-" * 15)`. Le fix vérifié : parenthéser INDIVIDUELLEMENT chaque
+  élément de la liste dès qu'il contient un opérateur arithmétique — `("-" * 50), ("-" * 20), ("-" *
+  15)` fonctionne, tout comme `-f ("-" * 50), ("-" * 20), ("-" * 15)`. Applique cette parenthésisation
+  systématique dans TOUTE liste séparée par virgules (arguments `-f`, construction de tableau `@(...)`
+  ou `$a = x, y, z`) dès qu'un élément utilise `*`, `+` ou `-` binaire — ne jamais compter sur la
+  précédence "intuitive" (arithmétique avant virgule) qui est FAUSSE en PowerShell."""
 
 CODER_FIX_SYSTEM = """Tu es CODER. Tu corriges du code en erreur.
 Réécris UNIQUEMENT les fichiers à corriger, format strict:
