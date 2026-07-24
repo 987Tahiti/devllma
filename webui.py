@@ -358,8 +358,24 @@ RÈGLES ABSOLUES:
   UNIQUEMENT — verifie directement), PAS le `ps` GNU/Linux complet. Aucune option `-o`/`--sort`
   n'existe, et AUCUNE colonne memoire (%mem/RSS) n'est jamais affichee, meme avec `ps aux` (erreur
   constatee : "ps: unknown option -- o"). Pour lister les processus par consommation memoire sous
-  Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command "Get-Process |
-  Sort-Object WorkingSet -Descending | Select-Object -First 5 Name,WorkingSet"`.
+  Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command '...'`.
+- RÈGLE CRITIQUE Bash→PowerShell (guillemets DOUBLES autour du payload `-Command` = danger si le
+  code PowerShell contient `$_` ou toute variable `$X`) : quand un script Bash appelle
+  `powershell.exe -Command "..."` avec le code PowerShell entre GUILLEMETS DOUBLES, BASH LUI-MÊME
+  interprète et substitue tout `$variable` À L'INTÉRIEUR de cette chaîne AVANT de la transmettre à
+  PowerShell — y compris `$_` (variable de pipeline PowerShell), que Bash traite comme SON PROPRE
+  paramètre spécial `$_` (contient typiquement le chemin de l'interpréteur bash, ex: `/usr/bin/bash`,
+  au tout début d'un script). Constaté et reproduit exactement : `powershell.exe -Command "... -f
+  $_.ProcessName, ..."` envoie en réalité `-f /usr/bin/bash.ProcessName, ...` À POWERSHELL (le `$_`
+  a déjà été remplacé par Bash), provoquant une cascade d'erreurs de parsing PowerShell («Jeton
+  inattendu», «Parenthèse fermante manquante»...) — et le script Bash englobant sort quand même en
+  code 0 (aucune vérification du code de sortie de `powershell.exe`), donnant un FAUX SUCCÈS total
+  : zéro donnée réelle produite, juste un mur d'erreurs PowerShell imprimées puis ignorées. Fix
+  vérifié : entourer le payload PowerShell de GUILLEMETS SIMPLES (`powershell.exe -Command '...'`)
+  au lieu de doubles dès qu'il contient `$_` ou toute syntaxe PowerShell utilisant `$` — les
+  guillemets simples empêchent TOUTE expansion par Bash, le code passe intact à PowerShell. Ne
+  JAMAIS utiliser de guillemets doubles pour un payload `-Command` contenant `$_`/`$something` de
+  syntaxe PowerShell.
 - Bash sur Windows (meme environnement) : `df -h` n'affiche JAMAIS de peripherique au format
   `/dev/sda1` — la colonne "Filesystem" contient directement un CHEMIN de type `C:/Program
   Files/Git` (verifie directement). Un filtre `grep "^/dev/"` pour ignorer la ligne d'en-tete
