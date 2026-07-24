@@ -340,14 +340,15 @@ RÈGLES ABSOLUES:
   "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"` pour l'heure de demarrage.
 - RÈGLE CRITIQUE PowerShell/`Get-Counter` (les noms de compteurs de performance sont LOCALISES EN
   FRANCAIS sur ce poste, PAS les noms anglais standards documentes en ligne) : `Get-Counter
-  '\Processor(_Total)\% Processor Time'` ou `'\Network Interface(*)\Bytes Sent/sec'` (noms anglais,
-  les plus courants dans la documentation/exemples en ligne) ECHOUENT TOUJOURS ici avec "L'objet
-  specifie n'a pas ete trouve sur l'ordinateur" — constate deux fois independamment (charge CPU,
-  puis debit reseau par interface). Verifie directement (`Get-Counter -ListSet "*"`) les VRAIS noms
-  sur ce poste : le jeu de compteurs CPU s'appelle `Processeur` (pas `Processor`), chemin correct
-  `\Processeur(_Total)\% temps processeur` (pas `% Processor Time`) ; le jeu reseau s'appelle
-  `Interface reseau` (pas `Network Interface`), chemins corrects `\Interface reseau(*)\Octets
-  envoyes/s` et `\Interface reseau(*)\Octets recus/s` (pas `Bytes Sent/sec`/`Bytes Received/sec`).
+  '\\Processor(_Total)\\% Processor Time'` ou `'\\Network Interface(*)\\Bytes Sent/sec'` (noms
+  anglais, les plus courants dans la documentation/exemples en ligne) ECHOUENT TOUJOURS ici avec
+  "L'objet specifie n'a pas ete trouve sur l'ordinateur" — constate deux fois independamment (charge
+  CPU, puis debit reseau par interface). Verifie directement (`Get-Counter -ListSet "*"`) les VRAIS
+  noms sur ce poste : le jeu de compteurs CPU s'appelle `Processeur` (pas `Processor`), chemin
+  correct `\\Processeur(_Total)\\% temps processeur` (pas `% Processor Time`) ; le jeu reseau
+  s'appelle `Interface reseau` (pas `Network Interface`), chemins corrects `\\Interface
+  reseau(*)\\Octets envoyes/s` et `\\Interface reseau(*)\\Octets recus/s` (pas `Bytes Sent/sec`/
+  `Bytes Received/sec`).
   Si un script doit lire un compteur de performance, PREFERE `Get-CimInstance` (noms de classes/
   proprietes STABLES et non-localises : `Win32_PerfFormattedData_Tcpip_NetworkInterface`,
   `Win32_Processor.LoadPercentage`...) a `Get-Counter`, dont les chemins textuels dependent de la
