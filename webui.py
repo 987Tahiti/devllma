@@ -395,6 +395,15 @@ RÈGLES ABSOLUES:
   (ex: `.Status`, `.State`) avec un PARAMETRE du cmdlet qui le genere — pour filtrer par une
   propriete, utilise `Get-X | Where-Object PropertyName -eq valeur`, jamais `Get-X -PropertyName
   valeur` sauf si tu es certain que ce parametre existe reellement sur CE cmdlet precis.
+- PowerShell/pilotes systeme (`Win32_PnPSignedDriver`) : la propriete `.DriverName` existe mais est
+  VIDE en pratique sur la plupart des machines Windows reelles (constate directement : `Get-WmiObject
+  -Class Win32_PnPSignedDriver | Select -First 1 | Format-List DriverName` -> chaine vide) — utilise
+  `.DeviceName` pour un nom lisible du pilote/peripherique, jamais `.DriverName`. Egalement, `.DriverDate`
+  (et toute propriete date de type WMI/CIM) est une CHAINE au format CIM_DATETIME brut
+  (`yyyyMMddHHmmss.ffffff+UUU`, ex: `20060621000000.000000+000`), PAS un objet `[DateTime]` — un
+  simple `-split ' '` ou `.ToString()` dessus ne fait AUCUNE conversion utile (aucune espace dans la
+  chaine). Conversion verifiee : `[Management.ManagementDateTimeConverter]::ToDateTime($driver.DriverDate)`
+  retourne un vrai `[DateTime]` correctement forme.
 - RÈGLE CRITIQUE PowerShell (ordre `param()` vs `$ErrorActionPreference`) : si le script declare un
   bloc `param(...)` (parametres nommes/types), ce bloc DOIT être la TOUTE PREMIERE instruction du
   fichier — RIEN, pas meme `$ErrorActionPreference = 'Stop'`, ne doit le precéder (seuls des
