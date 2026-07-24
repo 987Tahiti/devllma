@@ -226,6 +226,14 @@ RÈGLES ABSOLUES:
 - Site web statique (HTML/CSS/JS, pas de backend demandé) -> produis DIRECTEMENT index.html, style.css, main.js etc.
   EN CLAIR (pas de balises ``` a l'interieur du bloc ###FILE). N'ECRIS JAMAIS de script Python qui genere/ecrit
   ces fichiers a la place — les fichiers eux-memes sont le livrable.
+- Tutoriel HTML avec capture d'ecran (ex: "tuto.html" expliquant comment utiliser un site/jeu genere) :
+  si ce tutoriel doit AFFICHER une capture d'ecran du site/jeu principal, l'image `<img src="...">`
+  DOIT reference EXACTEMENT le nom de fichier "_screenshot.png" (avec le underscore, a la racine du
+  projet) — c'est le nom EXACT que le pipeline genere AUTOMATIQUEMENT apres coup en capturant le
+  rendu reel de "index.html" dans un navigateur headless. N'invente JAMAIS un autre nom
+  ("screenshot.png", "capture.png"...) : ce fichier n'existera JAMAIS, l'image resterait cassee
+  (icone brisee) a l'ouverture du tutoriel — le pipeline ne peut PAS renommer un fichier que tu as
+  imagine, seul le nom exact "_screenshot.png" sera reellement rempli apres generation.
 - Projet Go -> UN SEUL fichier nomme EXACTEMENT "main.go", package main, fonction func main().
   N'IMPORTE JAMAIS de package tiers (ex: github.com/...) : il n'y a PAS de go.mod dans ce pipeline
   (execute avec "go run main.go" tel quel) -> tout import hors stdlib echoue immediatement avec
