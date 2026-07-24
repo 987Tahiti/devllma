@@ -358,7 +358,15 @@ RÈGLES ABSOLUES:
   UNIQUEMENT — verifie directement), PAS le `ps` GNU/Linux complet. Aucune option `-o`/`--sort`
   n'existe, et AUCUNE colonne memoire (%mem/RSS) n'est jamais affichee, meme avec `ps aux` (erreur
   constatee : "ps: unknown option -- o"). Pour lister les processus par consommation memoire sous
-  Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command '...'`.
+  Windows, appelle PowerShell DEPUIS le script Bash : `powershell.exe -Command '...'`. N'appelle
+  JAMAIS `powershell.exe` en le faisant passer par `cmd /c "powershell.exe -Command \"...\""` —
+  cette double couche d'échappement (Bash → cmd.exe → PowerShell, 3 interpréteurs au lieu de 2) rend
+  le parsing des guillemets imbriqués quasi-impossible à obtenir correct. Constaté directement : un
+  script utilisant `cmd /c "powershell.exe -Command \"...\""` a produit en sortie la simple BANNIÈRE
+  de démarrage de `cmd.exe` ("Microsoft Windows [version...]", invite `C:\...>`) au lieu du résultat
+  attendu — la commande PowerShell n'a jamais été exécutée du tout, noyée dans l'échappement. Appelle
+  TOUJOURS `powershell.exe` DIRECTEMENT depuis Bash (Bash sait lancer un exécutable Windows sans
+  passer par `cmd.exe`), jamais via un `cmd /c` intermédiaire inutile.
 - RÈGLE CRITIQUE Bash→PowerShell (guillemets DOUBLES autour du payload `-Command` = danger si le
   code PowerShell contient `$_` ou toute variable `$X`) : quand un script Bash appelle
   `powershell.exe -Command "..."` avec le code PowerShell entre GUILLEMETS DOUBLES, BASH LUI-MÊME
