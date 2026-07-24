@@ -478,6 +478,24 @@ RÈGLES ABSOLUES:
   dépendre la valeur par défaut d'un paramètre d'un autre paramètre Mandatory — soit donne aussi
   une valeur par défaut au premier paramètre, soit calcule la valeur dérivée (ex: `$RuleName`) DANS
   le corps du script après le bloc `param()`, jamais dans l'expression de défaut elle-même.
+- RÈGLE CRITIQUE PowerShell (`Read-Host` = BLOCAGE INDEFINI garanti sous ce pipeline, JAMAIS
+  autorisé) : n'utilise JAMAIS `Read-Host` (ou tout autre mecanisme d'invite interactive) pour
+  demander une confirmation ("Voulez-vous continuer ? O/N") ou une valeur a l'utilisateur — ce
+  pipeline execute les scripts via un SUBPROCESS SANS CONSOLE INTERACTIVE ATTACHEE (meme famille
+  que le bug Mandatory/param() ci-dessus). Verifie directement avec une reproduction FIDELE de
+  l'invocation exacte de ce pipeline (`subprocess.Popen([...], stdout=PIPE, stderr=STDOUT)`, sans
+  redirection explicite de stdin) : un script contenant `Read-Host "confirmer ? (O/N)"` reste
+  BLOQUE INDEFINIMENT (aucune sortie, aucune erreur, consomme tout le timeout d'execution) — pas
+  une erreur rapide et visible, un vrai blocage silencieux indiscernable d'un script juste lent.
+  Constate concretement sur un script de verification de services Windows critiques qui demandait
+  confirmation avant de redemarrer un service arrete : le test a reussi UNIQUEMENT PAR CHANCE (les
+  3 services testes etaient deja tous demarres, la branche `Read-Host` n'a jamais ete atteinte) —
+  si UN SEUL des services avait ete arrete, le script aurait bloque indefiniment. Pour toute action
+  potentiellement destructive (redemarrer un service, supprimer un fichier...), soit agis
+  directement SANS demander de confirmation (le script est deja execute de façon non-interactive,
+  une confirmation est structurellement impossible a obtenir), soit accepte un PARAMETRE explicite
+  en ligne de commande (ex: `-Force` ou `-Confirm:$false`) pour piloter ce choix, jamais une
+  invite interactive au milieu de l'execution.
 - RÈGLE CRITIQUE PowerShell (continuation de ligne avec backtick `` ` ``) : le backtick DOIT être
   le TOUT DERNIER caractère de la ligne pour continuer une commande sur la ligne suivante — un
   commentaire `# ...` placé APRÈS le backtick sur la même ligne CASSE silencieusement la
