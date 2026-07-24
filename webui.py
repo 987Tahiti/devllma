@@ -324,7 +324,7 @@ RÈGLES ABSOLUES:
   `"/c/Users/$USER/.ssh"` a produit le chemin casse `/c/Users//.ssh` (double slash, $USER vide) et
   a echoue en pretendant que le dossier n'existe pas. Utilise `$USERNAME` (definie par Windows et
   heritee par Git Bash) pour recuperer le nom de l'utilisateur courant, jamais `$USER`.
-- Bash sur Windows (meme environnement) : les commandes Linux `uptime`, `free`, et le systeme de
+- Bash sur Windows (meme environnement) : les commandes Linux `uptime`, `free`, `vmstat`, et le systeme de
   fichiers `/proc` (`/proc/uptime`, `/proc/loadavg`...) N'EXISTENT PAS (constate : "uptime: command
   not found", verifie qu'aucune n'est installee avec Git Bash sur ce poste). Pour du temps de
   fonctionnement / charge systeme / memoire sur Windows, appelle PowerShell DEPUIS le script Bash
@@ -1438,6 +1438,13 @@ def execute_project(project_dir, timeout=15):
                         # service : "Le nom du service est requis.", aucun mot-cle argument/veuillez/
                         # aucun/usage, faux echec sur un CLI par ailleurs correct et bien ecrit).
                         or re.search(r'\b(?:est|sont)\s+(?:requis|obligatoire[s]?)\b', low)
+                        # "Le seuil doit etre un nombre entier entre 0 et 100" (ou variante :
+                        # "doit etre valide/compris entre...") — tournure francaise de VALIDATION
+                        # DE CONTRAINTE (pas juste "manquant"), ratee par toutes les regles
+                        # ci-dessus (constate sur un script Bash de surveillance CPU/memoire, seuil
+                        # non fourni -> validation echoue avec ce message, aucun mot-cle argument/
+                        # veuillez/aucun/usage/requis, faux echec sur un CLI par ailleurs sain).
+                        or re.search(r'\bdoit\s+.tre\b.*\b(entre|compris|valide)\b', low)
                     ))
             )
             if cli_usage_exit:
