@@ -384,6 +384,20 @@ RÈGLES ABSOLUES:
   guillemets simples empêchent TOUTE expansion par Bash, le code passe intact à PowerShell. Ne
   JAMAIS utiliser de guillemets doubles pour un payload `-Command` contenant `$_`/`$something` de
   syntaxe PowerShell.
+- RÈGLE CRITIQUE Bash→PowerShell (le BACKTICK n'est PAS le caractère d'échappement de Bash, même
+  si c'est celui de PowerShell) : constaté à DEUX reprises indépendantes (dont une fois sur les 3
+  lignes d'un même bloc, pas un simple lapsus isolé) — un script Bash écrit `` `$_.Used `` (un
+  BACKTICK litéral devant `$_`) en pensant échapper la variable PowerShell, provoquant "unexpected
+  EOF while looking for matching `'" (Bash interprète le backtick comme un début de substitution de
+  commande héritée, JAMAIS refermée). Cette confusion vient probablement du fait que le backtick EST
+  bien le caractère d'échappement NATIF de PowerShell (ex: `` `n ``/`` `t ``) — mais à CE point du
+  traitement (encore côté Bash, avant que PowerShell ne voie quoi que ce soit), c'est Bash qui
+  interprète la chaîne en premier, et Bash n'a AUCUNE notion des conventions d'échappement de
+  PowerShell. Pour empêcher Bash d'interpréter un `$` PowerShell à l'intérieur d'une chaîne bash
+  entre guillemets DOUBLES, le SEUL caractère d'échappement valide est le BACKSLASH (`\$`), jamais
+  le backtick. Mais la solution la plus robuste (voir règle précédente) reste d'éviter le problème
+  entièrement : entourer tout le payload `-Command` de guillemets SIMPLES, qui n'ont besoin d'AUCUN
+  échappement de `$` — ni backslash, ni backtick.
 - Bash sur Windows (meme environnement) : `df -h` n'affiche JAMAIS de peripherique au format
   `/dev/sda1` — la colonne "Filesystem" contient directement un CHEMIN de type `C:/Program
   Files/Git` (verifie directement). Un filtre `grep "^/dev/"` pour ignorer la ligne d'en-tete
