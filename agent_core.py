@@ -304,7 +304,13 @@ def _tool_write_file(args):
             write_document(path, content)
         else:
             os.makedirs(parent, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            # .ps1 : Windows PowerShell 5.1 lit un script SANS BOM en supposant l'ANSI local
+            # plutot que l'UTF-8, ce qui corrompt le PARSEUR (pas juste l'affichage) des qu'un
+            # caractere multi-octets specifique apparait (ex: ✓/✗) — meme fix que write_files()
+            # dans webui.py, necessaire ici aussi car ce tool ecrit les fichiers via un chemin
+            # de code SEPARE (agent generaliste, pas le pipeline CODER).
+            enc = "utf-8-sig" if path.lower().endswith(".ps1") else "utf-8"
+            with open(path, "w", encoding=enc) as f:
                 f.write(content)
     except Exception as e:
         return {"error": f"écriture impossible : {e}"}
@@ -578,7 +584,11 @@ def _tool_edit_file(args):
         out = out.replace("\n", "\r\n")
     tmp = path + ".devllma_tmp"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
+        # Meme fix BOM que write_file/webui.write_files() : preserve/ajoute le BOM sur un .ps1
+        # edite, sinon une edition peut re-ecrire le fichier SANS BOM (perdant la protection
+        # contre la corruption du parseur PowerShell 5.1 meme si l'original en avait un).
+        enc = "utf-8-sig" if path.lower().endswith(".ps1") else "utf-8"
+        with open(tmp, "w", encoding=enc, newline="") as f:
             f.write(out)
         os.replace(tmp, path)
     except Exception as e:
