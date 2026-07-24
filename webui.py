@@ -442,6 +442,20 @@ RÈGLES ABSOLUES:
   prochaine execution d'une tache, pipe TOUJOURS le resultat de `Get-ScheduledTask` (ou chaque tache
   individuellement dans une boucle) vers `Get-ScheduledTaskInfo` — ne jamais supposer que ces
   proprietes existent directement sur l'objet de base `Get-ScheduledTask`.
+- RÈGLE CRITIQUE PowerShell (`Get-ScheduledTaskInfo -TaskName` SEUL echoue sur les taches en sous-
+  dossier) : dans une boucle `foreach ($task in $tasks)`, appeler `Get-ScheduledTaskInfo -TaskName
+  $task.TaskName` (sans `-TaskPath`) PLANTE des qu'une tache vit dans un sous-dossier du
+  planificateur (`-TaskPath` different de la racine `\`) — TRES courant en pratique (ex: les taches
+  Google Update vivent sous `\GoogleSystem\GoogleUpdater\`, de nombreuses taches systeme sous
+  `\Microsoft\Windows\...`). Constate directement : `Get-ScheduledTaskInfo -TaskName
+  'GoogleUpdaterTaskSystem...'` (sans -TaskPath) echoue avec "Le fichier specifie est introuvable"
+  (le cmdlet suppose implicitement la racine `\` quand seul `-TaskName` est fourni), alors que
+  `Get-ScheduledTask | Where TaskName -like 'GoogleUpdater*' | Get-ScheduledTaskInfo` (PIPE direct de
+  l'objet tache complet) fonctionne et retourne bien `.NextRunTime`. Fix : dans une boucle sur des
+  taches, TOUJOURS obtenir les infos via le PIPE de l'objet tache lui-meme (`$task |
+  Get-ScheduledTaskInfo`), jamais via `-TaskName` seul reconstruit a partir d'une simple chaine — le
+  pipe transmet a la fois `TaskName` ET `TaskPath`, `-TaskName` seul perd le `TaskPath` de la tache
+  d'origine.
 - RÈGLE CRITIQUE PowerShell (ordre `param()` vs `$ErrorActionPreference`) : si le script declare un
   bloc `param(...)` (parametres nommes/types), ce bloc DOIT être la TOUTE PREMIERE instruction du
   fichier — RIEN, pas meme `$ErrorActionPreference = 'Stop'`, ne doit le precéder (seuls des
