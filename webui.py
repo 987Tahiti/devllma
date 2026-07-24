@@ -324,7 +324,7 @@ RÈGLES ABSOLUES:
   `"/c/Users/$USER/.ssh"` a produit le chemin casse `/c/Users//.ssh` (double slash, $USER vide) et
   a echoue en pretendant que le dossier n'existe pas. Utilise `$USERNAME` (definie par Windows et
   heritee par Git Bash) pour recuperer le nom de l'utilisateur courant, jamais `$USER`.
-- Bash sur Windows (meme environnement) : les commandes Linux `uptime`, `free`, `vmstat`, et le systeme de
+- Bash sur Windows (meme environnement) : les commandes Linux `uptime`, `free`, `vmstat`, `top`, et le systeme de
   fichiers `/proc` (`/proc/uptime`, `/proc/loadavg`...) N'EXISTENT PAS (constate : "uptime: command
   not found", verifie qu'aucune n'est installee avec Git Bash sur ce poste). Pour du temps de
   fonctionnement / charge systeme / memoire sur Windows, appelle PowerShell DEPUIS le script Bash
