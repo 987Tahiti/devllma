@@ -414,6 +414,25 @@ RÈGLES ABSOLUES:
   argument unique. Regle generale : tout calcul/expression (arithmetique, concatenation `+`,
   operateur `-f`...) passe en argument direct a un cmdlet (`Write-Host`, `Write-Output`...) DOIT etre
   entoure de parentheses, jamais laisse nu apres le nom du cmdlet.
+- RÈGLE CRITIQUE PowerShell (`-f` SANS parentheses = collision avec `-ForegroundColor`, PAS une
+  erreur anodine) : cas particulier BEAUCOUP plus grave que les autres operateurs ci-dessus. Ecrire
+  `Write-Host "{0} {1}" -f $a, $b` (sans parentheses autour de toute l'expression) ne produit PAS un
+  mauvais affichage silencieux — PowerShell interprete `-f` comme une ABREVIATION du parametre nomme
+  `-ForegroundColor` de `Write-Host` (seul parametre du cmdlet commencant par "f", donc resolu sans
+  ambiguite), PUIS tente de lier `$a, $b` (un tableau) a ce parametre qui attend un
+  `[System.ConsoleColor]` — plante avec "Impossible de lier le parametre «ForegroundColor». Impossible
+  de convertir la valeur «...» en type «System.ConsoleColor»" (constate deux fois : reproduit isole
+  avec un simple `Write-Host "{0} {1}" -f "a", "b"`, ET sur un vrai script de liste de taches
+  planifiees qui affichait CORRECTEMENT son en-tete avec parentheses `Write-Host ("{0,-50}..." -f
+  "Nom", "Etat")` mais PAS sa boucle d'affichage par tache `Write-Host "{0,-50}..." -f $task.TaskName,
+  $task.State, $nextRun` — meme script, une ligne correcte et une ligne fautive juste a cote).
+  Cette erreur cite "ForegroundColor" dans son message, ce qui peut EGARER un debogage (rien dans le
+  code ne mentionne explicitement une couleur) — c'est pourtant TOUJOURS le meme piege : `-f` bare
+  sans parentheses. Fix : ENTOURE TOUJOURS `"chaine de format" -f arg1, arg2, ...` de parentheses
+  completes des qu'il est passe a un cmdlet (`Write-Host (... -f ...)`), MEME quand une autre ligne
+  du meme script utilise deja `-f` correctement entre parentheses ailleurs — verifie CHAQUE
+  occurrence individuellement, l'erreur est apparue precisement parce qu'UNE SEULE ligne sur
+  plusieurs similaires avait oublie les parentheses.
 - PowerShell/tâches planifiées (`Get-ScheduledTask`) : les objets retournes par `Get-ScheduledTask`
   N'ONT PAS de propriete `.NextRunTime` (ni `.LastRunTime`) — ces informations d'execution ne sont
   QUE sur l'objet retourne par `Get-ScheduledTaskInfo`, une commande SEPAREE. Constate directement :
