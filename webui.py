@@ -377,6 +377,19 @@ RÈGLES ABSOLUES:
   QU'APRÈS que cet appel unique a reussi (`$?` = 0) qu'on supprime les originaux avec `rm`. Ne
   JAMAIS supprimer un fichier source avant d'avoir confirme qu'il est bien present dans l'archive
   finale.
+- RÈGLE CRITIQUE Bash/awk (parser la sortie de `du`/`find`/`ls -l` dont le DERNIER champ est un
+  CHEMIN) : `awk` par defaut decoupe chaque ligne sur N'IMPORTE QUEL espace blanc (espaces ET
+  tabulations) — si le chemin en fin de ligne contient lui-meme des ESPACES (tres frequent sur ce
+  pipeline : noms de projet/dossier descriptifs a plusieurs mots), il se retrouve ECLATE en
+  plusieurs "champs" awk distincts, et prendre seulement `$2` ne recupere qu'UNE PARTIE du chemin
+  (le premier mot), jamais le chemin complet. Constate directement : `find dossier -type f -exec du
+  -b {} \; | awk '{print $2}'` sur un chemin reel `.../Coffre-fort mots de passe/.git/hooks`
+  n'affiche QUE `Coffre-fort` (les mots suivants "mots de passe/.git/hooks" sont silencieusement
+  perdus dans `$3`/`$4`/`$5`, jamais imprimes). `du` separe TOUJOURS taille et chemin par une VRAIE
+  tabulation (`\t`, verifie par inspection brute des octets) — fix : force `awk -F'\t'` (separateur
+  de champ = tabulation UNIQUEMENT, jamais l'espace) des que le champ final peut etre un chemin avec
+  espaces ; les scripts PowerShell de secours generes par ce pipeline le savent deja intuitivement
+  (guillemets systematiques), mais Bash+awk necessite ce rappel explicite.
 - PowerShell/espace disque : `Get-Volume` N'A PAS de propriete `.FreeSpace` (constate : un script
   utilisant `$volume.FreeSpace` avec `$volume = Get-Volume -DriveLetter ...` a affiche "0 Go" comme
   espace libre pour TOUS les lecteurs, sur un disque reellement a moitie plein — aucune erreur, car
